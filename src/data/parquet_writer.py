@@ -11,9 +11,12 @@ import pyarrow.parquet as pq
 
 
 def write_parquet_checkpoint(
-    chunks: Iterable[pd.DataFrame], output_path: str | Path, collect_every: int = 10
+    chunks: Iterable[pd.DataFrame],
+    output_path: str | Path,
+    schema: pa.Schema,
+    collect_every: int = 10,
 ) -> int:
-    """Write chunks incrementally, releasing each DataFrame/Arrow table after use."""
+    """Write chunks incrementally using one canonical Arrow schema."""
     destination = Path(output_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_suffix(destination.suffix + ".tmp")
@@ -21,9 +24,9 @@ def write_parquet_checkpoint(
     rows = 0
     try:
         for chunk_number, chunk in enumerate(chunks, start=1):
-            table = pa.Table.from_pandas(chunk, preserve_index=False)
+            table = pa.Table.from_pandas(chunk, schema=schema, preserve_index=False, safe=False)
             if writer is None:
-                writer = pq.ParquetWriter(temporary, table.schema, compression="snappy")
+                writer = pq.ParquetWriter(temporary, schema, compression="snappy")
             writer.write_table(table)
             rows += len(chunk)
             del table
@@ -36,4 +39,8 @@ def write_parquet_checkpoint(
     if writer is None:
         raise ValueError("Cannot create a checkpoint from an empty CSV.")
     temporary.replace(destination)
+    actual_schema = pq.read_schema(destination).remove_metadata()
+    expected_schema = schema.remove_metadata()
+    if not actual_schema.equals(expected_schema):
+        raise TypeError(f"Checkpoint schema does not match the canonical schema: {destination}")
     return rows

@@ -8,9 +8,10 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from src.data.csv_reader import read_csv_chunks
+from src.data.csv_reader import read_csv_chunks, read_csv_columns
 from src.data.gcs_storage import download_object_if_missing, object_name, upload_file
 from src.data.parquet_writer import write_parquet_checkpoint
+from src.data.schema import build_arrow_schema
 
 DEFAULT_INGESTS = {
     "train_ver2.csv": "train.parquet",
@@ -59,9 +60,12 @@ def create_parquet_checkpoint(
             f"Raw CSV not found: {input_path}. Remove --skip-download or place the file in data/raw."
         )
     output_path = config.checkpoint_dir / parquet_filename
+    schema = build_arrow_schema(read_csv_columns(input_path))
     print(f"[ingest] Building Parquet checkpoint: {output_path}")
     rows = write_parquet_checkpoint(
-        read_csv_chunks(input_path, config.chunksize, show_progress=show_progress), output_path
+        read_csv_chunks(input_path, config.chunksize, show_progress=show_progress),
+        output_path,
+        schema=schema,
     )
     print(f"[ingest] Checkpoint complete: {rows:,} rows -> {output_path}")
     return output_path, rows

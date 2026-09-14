@@ -7,9 +7,10 @@ The Santander training CSV is too large to assume it fits in a 4 GB local machin
 What the pipeline does:
 
 - Reads CSV or single-file ZIP input in bounded row chunks.
-- Reads known numeric/product columns directly as nullable `Int64`, `Float32`, and `Int8` instead of first materialising them as strings.
-- Normalises each chunk in place; it does not make a whole-DataFrame cleaning copy.
-- Converts each cleaned chunk to Arrow, appends it to one Snappy Parquet checkpoint, then releases the pandas/Arrow temporary objects. Garbage collection runs periodically.
+- Reads each raw chunk as strings. This prevents pandas from inferring a different type for sparse columns in different chunks (for example, an all-null `conyuemp` chunk versus a later chunk containing `S`/`N`).
+- Normalises each chunk in place, then explicitly casts semantic numeric fields to nullable `Int64`, `Float32`, or `Int8`; all remaining fields are canonical nullable strings.
+- Builds one canonical Arrow schema from the input header (therefore preserving the different train/test column sets) and forces every chunk to that schema before appending it to a Snappy Parquet checkpoint.
+- Validates the finished Parquet schema against the canonical schema, then releases the pandas/Arrow temporary objects. Garbage collection runs periodically.
 - Supports `usecols` in `read_csv_chunks()` for future consumers that truly need only a subset. Full ingest deliberately keeps all source columns to preserve the current checkpoint semantics.
 - Keeps raw/checkpoint paths configurable through `SANTANDER_DATA_ROOT`; Colab bootstrap points this at mounted Drive while local defaults to `data/`.
 
@@ -20,7 +21,7 @@ Default chunk sizes are conservative for the target RAM budgets:
 | Local (4 GB) | 50,000 rows | `SANTANDER_CHUNKSIZE` or `config_from_environment(chunksize=...)` |
 | Colab (12 GB) | 150,000 rows | `SANTANDER_CHUNKSIZE` or `config_from_environment(chunksize=...)` |
 
-This bounds peak RAM roughly to the active chunk plus its short-lived pandas/Arrow conversion objects, rather than the full multi-GB CSV. Exact memory depends on column text length and missingness, so start with the defaults and decrease the chunk size if the runtime approaches its memory limit.
+This bounds peak RAM roughly to the active chunk plus its short-lived pandas/Arrow conversion objects, rather than the full multi-GB CSV. Reading raw values as strings costs some additional memory within one chunk, but prevents schema drift and makes failures deterministic. Exact memory depends on column text length and missingness, so start with the defaults and decrease the chunk size if the runtime approaches its memory limit.
 
 Trade-off: streaming performs more disk I/O and has per-chunk overhead, so it can be slower than a full in-memory load on a high-memory machine. It is intentionally preferred here for reliable ingestion on both 4 GB local CPU and 12 GB Colab CPU.
 
