@@ -18,8 +18,11 @@ PRODUCT_COLUMNS = ("ind_ahor_fin_ult1", "ind_aval_fin_ult1", "ind_cco_fin_ult1",
 # numeric column fails before our per-chunk normalisation runs.
 MISSING_VALUES = ("", " ", "NA", " NA", "NA ", " N/A", "N/A", "N/A ", "Unknown")
 
-# Read these fields in their final nullable representation rather than materialising
-# them as Python strings and allocating a second converted column afterwards.
+# Final nullable dtypes written to the Parquet checkpoint.  These are applied
+# after raw text has been normalised for each chunk rather than passed directly
+# to ``read_csv``: the source has occasional whitespace-padded missing values
+# (for example ``" NA"``), which pandas may try to cast before ``na_values``
+# is handled consistently across parser versions.
 CSV_DTYPES = {
     **{column: "Int64" for column in INTEGER_COLUMNS},
     **{column: "Float32" for column in FLOAT_COLUMNS},
@@ -57,13 +60,13 @@ def parse_santander_dtypes(frame: pd.DataFrame) -> pd.DataFrame:
             frame[column] = pd.to_datetime(frame[column], format="%Y-%m-%d", errors="coerce")
     for column in INTEGER_COLUMNS:
         if column in frame and not is_integer_dtype(frame[column]):
-            frame[column] = pd.to_numeric(frame[column], errors="coerce").astype("Int64")
+            frame[column] = pd.to_numeric(frame[column], errors="coerce").astype(CSV_DTYPES[column])
     for column in FLOAT_COLUMNS:
         if column in frame and not is_float_dtype(frame[column]):
-            frame[column] = pd.to_numeric(frame[column], errors="coerce").astype("Float32")
+            frame[column] = pd.to_numeric(frame[column], errors="coerce").astype(CSV_DTYPES[column])
     for column in PRODUCT_COLUMNS:
         if column in frame and not is_integer_dtype(frame[column]):
-            frame[column] = pd.to_numeric(frame[column], errors="coerce").astype("Int8")
+            frame[column] = pd.to_numeric(frame[column], errors="coerce").astype(CSV_DTYPES[column])
     return frame
 
 
@@ -82,7 +85,6 @@ def read_csv_chunks(
     source = Path(path)
     reader = pd.read_csv(
         source,
-        dtype=CSV_DTYPES,
         na_values=MISSING_VALUES,
         skipinitialspace=True,
         encoding=encoding or detect_encoding(source),
