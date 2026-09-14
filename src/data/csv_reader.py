@@ -12,7 +12,11 @@ DATE_COLUMNS = ("fecha_dato", "fecha_alta", "ult_fec_cli_1t")
 INTEGER_COLUMNS = ("ncodpers", "ind_nuevo", "antiguedad", "indrel", "tipodom", "cod_prov", "ind_actividad_cliente")
 FLOAT_COLUMNS = ("age", "renta")
 PRODUCT_COLUMNS = ("ind_ahor_fin_ult1", "ind_aval_fin_ult1", "ind_cco_fin_ult1", "ind_cder_fin_ult1", "ind_cno_fin_ult1", "ind_ctju_fin_ult1", "ind_ctma_fin_ult1", "ind_ctop_fin_ult1", "ind_ctpp_fin_ult1", "ind_deco_fin_ult1", "ind_deme_fin_ult1", "ind_dela_fin_ult1", "ind_ecue_fin_ult1", "ind_fond_fin_ult1", "ind_hip_fin_ult1", "ind_plan_fin_ult1", "ind_pres_fin_ult1", "ind_reca_fin_ult1", "ind_tjcr_fin_ult1", "ind_valo_fin_ult1", "ind_viv_fin_ult1", "ind_nomina_ult1", "ind_nom_pens_ult1", "ind_recibo_ult1")
-MISSING_VALUES = ("", " ", "NA", "N/A", "Unknown")
+# Santander's CSV contains missing numeric fields written as both ``NA`` and
+# `` NA``.  ``na_values`` is applied by pandas *before* ``dtype=`` coercion,
+# so these spellings must be declared here; otherwise parsing a nullable
+# numeric column fails before our per-chunk normalisation runs.
+MISSING_VALUES = ("", " ", "NA", " NA", "NA ", " N/A", "N/A", "N/A ", "Unknown")
 
 # Read these fields in their final nullable representation rather than materialising
 # them as Python strings and allocating a second converted column afterwards.
@@ -80,6 +84,7 @@ def read_csv_chunks(
         source,
         dtype=CSV_DTYPES,
         na_values=MISSING_VALUES,
+        skipinitialspace=True,
         encoding=encoding or detect_encoding(source),
         compression="zip" if source.suffix.lower() == ".zip" else "infer",
         chunksize=chunksize,
