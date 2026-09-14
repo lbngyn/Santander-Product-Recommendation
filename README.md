@@ -1,5 +1,65 @@
 # Santander Product Recommendation
 
+## Memory-safe ingestion
+
+The Santander training CSV is too large to assume it fits in a 4 GB local machine. Ingestion is therefore streaming-only: it never loads or concatenates the complete dataset in memory.
+
+What the pipeline does:
+
+- Reads CSV or single-file ZIP input in bounded row chunks.
+- Reads known numeric/product columns directly as nullable `Int64`, `Float32`, and `Int8` instead of first materialising them as strings.
+- Normalises each chunk in place; it does not make a whole-DataFrame cleaning copy.
+- Converts each cleaned chunk to Arrow, appends it to one Snappy Parquet checkpoint, then releases the pandas/Arrow temporary objects. Garbage collection runs periodically.
+- Supports `usecols` in `read_csv_chunks()` for future consumers that truly need only a subset. Full ingest deliberately keeps all source columns to preserve the current checkpoint semantics.
+- Keeps raw/checkpoint paths configurable through `SANTANDER_DATA_ROOT`; Colab bootstrap points this at mounted Drive while local defaults to `data/`.
+
+Default chunk sizes are conservative for the target RAM budgets:
+
+| Runtime | Default | Override |
+| --- | ---: | --- |
+| Local (4 GB) | 50,000 rows | `SANTANDER_CHUNKSIZE` or `config_from_environment(chunksize=...)` |
+| Colab (12 GB) | 150,000 rows | `SANTANDER_CHUNKSIZE` or `config_from_environment(chunksize=...)` |
+
+This bounds peak RAM roughly to the active chunk plus its short-lived pandas/Arrow conversion objects, rather than the full multi-GB CSV. Exact memory depends on column text length and missingness, so start with the defaults and decrease the chunk size if the runtime approaches its memory limit.
+
+Trade-off: streaming performs more disk I/O and has per-chunk overhead, so it can be slower than a full in-memory load on a high-memory machine. It is intentionally preferred here for reliable ingestion on both 4 GB local CPU and 12 GB Colab CPU.
+
+## VS Code → Colab CPU: runtime config bundle
+
+Khi notebook chạy từ VS Code nhưng dùng Colab CPU, Colab Secrets không truy cập được. Bootstrap hỗ trợ một bundle Base64 duy nhất thay cho việc nhập từng credential.
+
+Tạo `secrets/colab_runtime_config.json` (thư mục `secrets/` đã được Git ignore) với các key bắt buộc:
+
+```json
+{
+  "GITHUB_TOKEN": "github_pat_...",
+  "GCP_SERVICE_ACCOUNT_JSON": { "type": "service_account" },
+  "GOOGLE_CLOUD_PROJECT": "your-project-id",
+  "GCS_BUCKET": "your-bucket",
+  "GCS_RAW_PREFIX": "santander/raw",
+  "GCS_CHECKPOINT_PREFIX": "santander/interim"
+}
+```
+
+`GCP_SERVICE_ACCOUNT_JSON` phải là toàn bộ JSON object trong service-account key, không chỉ phần `type` trong ví dụ.
+
+Tạo Base64 một dòng và copy thẳng vào clipboard trên Windows PowerShell:
+
+```powershell
+$bundle = Get-Content -Raw "secrets\colab_runtime_config.json"
+[Convert]::ToBase64String(
+  [System.Text.Encoding]::UTF8.GetBytes($bundle)
+) | Set-Clipboard
+```
+
+Chạy bootstrap cell trong notebook Colab rồi paste tại prompt `COLAB_RUNTIME_CONFIG_B64`. Bundle chỉ được giữ trong RAM của runtime hiện tại. Sau khi paste, xoá clipboard:
+
+```powershell
+Set-Clipboard -Value ""
+```
+
+Không commit file config, service-account JSON, GitHub PAT, Base64 bundle, hoặc output cell có secret. Nếu extension hỗ trợ environment variable cho remote kernel, đặt `COLAB_RUNTIME_CONFIG_B64` để bootstrap không cần hỏi prompt.
+
 Skeleton để tổ chức side project Santander Product Recommendation. Repository hiện chỉ chứa cấu trúc thư mục — chưa có pipeline, model, dependency hay notebook implementation.
 
 ## Cấu trúc

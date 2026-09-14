@@ -26,9 +26,16 @@ def credentials_from_secret() -> object | None:
         raise ValueError("GCP_SERVICE_ACCOUNT_JSON must contain a valid service-account JSON object.") from error
     try:
         from google.oauth2 import service_account
+        from google.auth.exceptions import MalformedError
     except ModuleNotFoundError as error:
         raise RuntimeError("Install dependencies with: pip install -r requirements.txt") from error
-    return service_account.Credentials.from_service_account_info(service_account_info)
+    try:
+        return service_account.Credentials.from_service_account_info(service_account_info)
+    except (ValueError, MalformedError) as error:
+        raise ValueError(
+            "GCP_SERVICE_ACCOUNT_JSON is incomplete. Copy the full service-account key JSON "
+            "from Google Cloud, including token_uri and private_key fields."
+        ) from error
 
 
 def get_gcs_client(project_id: str | None = None) -> "Client":

@@ -35,6 +35,35 @@ The project should demonstrate Data Science and ML Engineering skills.
 - Present assumptions as proven conclusions.
 - Make broad changes when a smaller change is sufficient.
 
+## Resource-Aware Data Processing
+
+All data-processing code must run safely on:
+- Local CPU: max 4 GB RAM.
+- Google Colab: max 12 GB RAM.
+
+Never assume the full dataset fits in memory. Choose memory-efficient techniques based on the current processing stage, including:
+
+- Chunked/batch ingestion.
+- Reading only required columns.
+- Explicit and optimized dtypes / numeric downcasting.
+- Avoiding unnecessary DataFrame copies and large in-memory concatenations.
+- Incremental aggregation.
+- Intermediate Parquet checkpoints.
+- DuckDB or other disk-backed processing for large joins, aggregations, sorting, window functions, and feature engineering.
+- Memory limits, limited parallelism, and spill-to-disk.
+- Materializing only small samples or aggregates into Pandas.
+- Releasing large temporary objects when no longer needed.
+
+Environment-specific settings such as chunk size, memory limits, thread count, paths, and temporary storage must be configurable.
+
+Prioritize bounded peak RAM and reliability over maximum execution speed.
+
+Whenever a memory optimization is introduced, update the README with:
+1. What was changed.
+2. Why the optimization was needed.
+3. How it reduces memory usage or improves scalability.
+4. Any trade-offs introduced, such as additional disk I/O or longer runtime.
+
 ## Working Principles
 1. **Understand first:** inspect evidence and identify the real problem.
 2. **Work incrementally:** choose the smallest useful next step.

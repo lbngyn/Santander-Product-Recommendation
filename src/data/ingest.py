@@ -16,6 +16,8 @@ DEFAULT_INGESTS = {
     "train_ver2.csv": "train.parquet",
     "test_ver2.csv": "test.parquet",
 }
+LOCAL_CHUNKSIZE = 50_000
+COLAB_CHUNKSIZE = 150_000
 
 
 @dataclass(frozen=True)
@@ -26,7 +28,7 @@ class IngestConfig:
     project_id: str | None = None
     raw_dir: Path = Path("data/raw")
     checkpoint_dir: Path = Path("data/interim")
-    chunksize: int = 250_000
+    chunksize: int = LOCAL_CHUNKSIZE
 
 
 def download_raw_data(config: IngestConfig, csv_filename: str, force: bool = False) -> Path | None:
@@ -34,10 +36,22 @@ def download_raw_data(config: IngestConfig, csv_filename: str, force: bool = Fal
     relative_csv_path = Path(csv_filename)
     remote_object = object_name(config.raw_prefix, relative_csv_path)
     local_path = config.raw_dir / relative_csv_path
-    return download_object_if_missing(config.bucket, remote_object, local_path, config.project_id, force)
+    if local_path.is_file() and not force:
+        print(f"[ingest] Reusing local raw file: {local_path}")
+    else:
+        print(f"[ingest] Downloading gs://{config.bucket}/{remote_object} -> {local_path}")
+    downloaded = download_object_if_missing(config.bucket, remote_object, local_path, config.project_id, force)
+    if downloaded:
+        print(f"[ingest] Download complete: {downloaded}")
+    return downloaded
 
 
-def create_parquet_checkpoint(config: IngestConfig, csv_filename: str, parquet_filename: str) -> tuple[Path, int]:
+def create_parquet_checkpoint(
+    config: IngestConfig,
+    csv_filename: str,
+    parquet_filename: str,
+    show_progress: bool = True,
+) -> tuple[Path, int]:
     """Read local raw CSV, parse dtypes/encoding, and write a Parquet checkpoint."""
     input_path = config.raw_dir / csv_filename
     if not input_path.is_file():
@@ -45,14 +59,22 @@ def create_parquet_checkpoint(config: IngestConfig, csv_filename: str, parquet_f
             f"Raw CSV not found: {input_path}. Remove --skip-download or place the file in data/raw."
         )
     output_path = config.checkpoint_dir / parquet_filename
-    rows = write_parquet_checkpoint(read_csv_chunks(input_path, config.chunksize), output_path)
+    print(f"[ingest] Building Parquet checkpoint: {output_path}")
+    rows = write_parquet_checkpoint(
+        read_csv_chunks(input_path, config.chunksize, show_progress=show_progress), output_path
+    )
+    print(f"[ingest] Checkpoint complete: {rows:,} rows -> {output_path}")
     return output_path, rows
 
 
 def upload_checkpoint(config: IngestConfig, checkpoint_path: str | Path) -> str:
     """Upload a checkpoint to the configured GCS prefix."""
     path = Path(checkpoint_path)
-    return upload_file(path, config.bucket, object_name(config.checkpoint_prefix, path.name), config.project_id)
+    destination = object_name(config.checkpoint_prefix, path.name)
+    print(f"[ingest] Uploading checkpoint: {path} -> gs://{config.bucket}/{destination}")
+    uri = upload_file(path, config.bucket, destination, config.project_id)
+    print(f"[ingest] Upload complete: {uri}")
+    return uri
 
 
 def run_full_ingest(
@@ -63,6 +85,7 @@ def run_full_ingest(
     skip_upload: bool = True,
     force_download: bool = False,
     force_rebuild: bool = False,
+    show_progress: bool = True,
 ) -> dict[str, object]:
     """Run the cache-aware GCS download → Parquet checkpoint workflow.
 
@@ -78,10 +101,16 @@ def run_full_ingest(
     should_rebuild = downloaded_file is not None or force_rebuild or not checkpoint_path.is_file()
     rows: int | None = None
     if should_rebuild:
-        checkpoint_path, rows = create_parquet_checkpoint(config, csv_filename, parquet_filename)
+        checkpoint_path, rows = create_parquet_checkpoint(
+            config, csv_filename, parquet_filename, show_progress=show_progress
+        )
+    else:
+        print(f"[ingest] Reusing local checkpoint: {checkpoint_path}")
 
     should_upload = downloaded_file is not None or not skip_upload
     checkpoint_uri = upload_checkpoint(config, checkpoint_path) if should_upload else None
+    if not should_upload:
+        print("[ingest] Upload skipped: raw file was reused and skip_upload=True.")
     return {
         "downloaded_file": str(downloaded_file) if downloaded_file else None,
         "checkpoint_rebuilt": should_rebuild,
@@ -97,6 +126,7 @@ def run_default_ingests(
     skip_upload: bool = True,
     force_download: bool = False,
     force_rebuild: bool = False,
+    show_progress: bool = True,
 ) -> dict[str, dict[str, object]]:
     """Ingest the standard Santander train and test CSV files with one call."""
     return {
@@ -108,13 +138,26 @@ def run_default_ingests(
             skip_upload=skip_upload,
             force_download=force_download,
             force_rebuild=force_rebuild,
+            show_progress=show_progress,
         )
         for csv_filename, parquet_filename in DEFAULT_INGESTS.items()
     }
 
 
-def config_from_environment(chunksize: int) -> IngestConfig:
-    """Read non-secret GCS config from the environment or local .env file."""
+def default_chunksize() -> int:
+    """Choose a bounded default suitable for the active runtime's RAM budget."""
+    configured = os.getenv("SANTANDER_CHUNKSIZE")
+    if configured:
+        value = int(configured)
+        if value < 1:
+            raise ValueError("SANTANDER_CHUNKSIZE must be positive.")
+        return value
+    is_colab = os.getenv("SANTANDER_RUNTIME") == "colab" or bool(os.getenv("COLAB_RELEASE_TAG"))
+    return COLAB_CHUNKSIZE if is_colab else LOCAL_CHUNKSIZE
+
+
+def config_from_environment(chunksize: int | None = None) -> IngestConfig:
+    """Read GCS, data-path, and memory-bound chunk config from the environment."""
     load_dotenv()
     bucket = os.getenv("GCS_BUCKET")
     if not bucket:
@@ -127,7 +170,7 @@ def config_from_environment(chunksize: int) -> IngestConfig:
         project_id=os.getenv("GOOGLE_CLOUD_PROJECT"),
         raw_dir=data_root / "raw",
         checkpoint_dir=data_root / "interim",
-        chunksize=chunksize,
+        chunksize=chunksize if chunksize is not None else default_chunksize(),
     )
 
 
@@ -135,7 +178,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the full Santander GCS ingestion flow.")
     parser.add_argument("csv_filename", nargs="?", default="train_ver2.csv", help="Filename under data/raw and the raw GCS prefix")
     parser.add_argument("parquet_filename", nargs="?", default="train.parquet", help="Output filename under data/interim")
-    parser.add_argument("--chunksize", type=int, default=250_000)
+    parser.add_argument("--chunksize", type=int, help="Rows per bounded-memory CSV chunk")
     download_mode = parser.add_mutually_exclusive_group()
     download_mode.add_argument("--skip-download", action="store_true", help="Use existing local raw data without a GCS download")
     download_mode.add_argument("--force-download", action="store_true", help="Download from GCS even when data/raw already has files")
@@ -146,7 +189,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if args.chunksize < 1:
+    if args.chunksize is not None and args.chunksize < 1:
         raise SystemExit("--chunksize must be positive.")
     try:
         config = config_from_environment(args.chunksize)
