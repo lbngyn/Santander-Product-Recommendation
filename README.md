@@ -77,6 +77,7 @@ $bundle = Get-Content -Raw "secrets\colab_runtime_config.json"
 
 Chạy bootstrap cell trong notebook Colab rồi paste tại prompt `COLAB_RUNTIME_CONFIG_B64`. Bundle chỉ được giữ trong RAM của runtime hiện tại. Sau khi paste, xoá clipboard:
 
+
 ```powershell
 Set-Clipboard -Value ""
 ```

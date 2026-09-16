@@ -228,3 +228,4 @@ artifacts/*
 !artifacts/.gitkeep
 mlruns/
 secrets/
+.codex/
