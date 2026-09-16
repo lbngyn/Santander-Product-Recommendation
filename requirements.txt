@@ -1,5 +1,7 @@
 pandas
 pyarrow
+duckdb
+matplotlib
 google-cloud-storage
 python-dotenv
 tqdm

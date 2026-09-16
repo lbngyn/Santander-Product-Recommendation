@@ -64,6 +64,15 @@ Whenever a memory optimization is introduced, update the README with:
 3. How it reduces memory usage or improves scalability.
 4. Any trade-offs introduced, such as additional disk I/O or longer runtime.
 
+## Feature Engineering
+
+- Put reusable feature engineering code in `src/features/`; notebooks should import and call these modules rather than duplicate implementation logic.
+- Persist feature/preprocessing outputs to the canonical datasets `processed/train.parquet` and `processed/test.parquet`. Preserve unrelated columns and never overwrite raw/source data.
+- Feature functions must support `force_process: bool = False`, scoped only to the feature or feature group owned by that function.
+- With `force_process=False`, check the canonical dataset: if all target columns exist, skip processing; otherwise compute the missing targets and persist the update.
+- With `force_process=True`, recompute and overwrite only the function's target columns, preserving unrelated features.
+- Column existence is the only freshness check. Do not add versioning, hashes, timestamps, dependency fingerprints, or other invalidation mechanisms unless explicitly requested.
+
 ## Working Principles
 1. **Understand first:** inspect evidence and identify the real problem.
 2. **Work incrementally:** choose the smallest useful next step.

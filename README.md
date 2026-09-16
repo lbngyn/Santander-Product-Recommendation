@@ -1,5 +1,12 @@
 # Santander Product Recommendation
 
+# Overview dataset: 
+- **Provider**: Santander Bank → Product là các dịch vụ liên quan tới tài chính (như là các loại tài khoản, các dịch vụ vay, thuế, credit card)
+- **Dataset**:
+    - Thời gian: `28-01-2015` → `28-05-2016`
+    - Bản ghi các dịch vụ mà người dùng đã đăng kí của cty cùng với các thông tin cá nhân của người dùng.
+- **Target**: tìm các **additional product** của từng customer tại thời điểm `28-06-2016`
+
 ## Memory-safe ingestion
 
 The Santander training CSV is too large to assume it fits in a 4 GB local machine. Ingestion is therefore streaming-only: it never loads or concatenates the complete dataset in memory.
@@ -24,6 +31,21 @@ Default chunk sizes are conservative for the target RAM budgets:
 This bounds peak RAM roughly to the active chunk plus its short-lived pandas/Arrow conversion objects, rather than the full multi-GB CSV. Reading raw values as strings costs some additional memory within one chunk, but prevents schema drift and makes failures deterministic. Exact memory depends on column text length and missingness, so start with the defaults and decrease the chunk size if the runtime approaches its memory limit.
 
 Trade-off: streaming performs more disk I/O and has per-chunk overhead, so it can be slower than a full in-memory load on a high-memory machine. It is intentionally preferred here for reliable ingestion on both 4 GB local CPU and 12 GB Colab CPU.
+
+## Acquisition target features
+
+`src/features/acquisition.py` builds `acq_<product_column>` targets in
+`data/processed/train.parquet`.  For every customer record, a target is `1`
+only when the product changes from `0` in that customer's nearest earlier
+record to `1` in the current record; all other cases, including a customer's
+first record, are `0`.  Each target is stored as Parquet `TINYINT`.
+
+The feature step uses DuckDB window functions and writes Parquet directly to a
+temporary file before an atomic replace. This avoids loading the full panel
+into pandas/RAM, at the cost of a disk-backed sort and one processed Parquet
+write. `data/processed/test.parquet` is also copied once as the canonical test
+checkpoint; it has no acquisition targets because Santander test data has no
+product-state columns.
 
 ## VS Code → Colab CPU: runtime config bundle
 
