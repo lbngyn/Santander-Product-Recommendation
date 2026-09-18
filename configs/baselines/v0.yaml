@@ -1,0 +1,61 @@
+pipeline:
+  version: baseline-v0
+  description: GCS-backed, cache-aware popularity recommendation baseline.
+
+# Credentials are provided only by bootstrap through environment variables.
+storage:
+  bucket: ${oc.env:GCS_BUCKET}
+  project_id: ${oc.env:GOOGLE_CLOUD_PROJECT}
+  raw_prefix: ${oc.env:GCS_RAW_PREFIX}
+  checkpoint_prefix: ${oc.env:GCS_CHECKPOINT_PREFIX}
+  artifact_prefix: santander/artifacts/baseline_v0
+  upload_checkpoints: true
+  upload_artifacts: true
+
+# These paths are relative to SANTANDER_DATA_ROOT (Google Drive in Colab).
+data:
+  raw_dir: raw
+  raw_train_filename: train_ver2.csv
+  interim_dir: interim
+  processed_dir: processed
+  artifact_dir: artifacts
+
+ingestion:
+  chunksize: 50000
+  force_download: false
+  force_rebuild: false
+  show_progress: true
+
+preprocessing:
+  force_process: false
+  renta_clip_lower_quantile: 0.0
+  renta_clip_upper_quantile: 0.99
+
+split:
+  name: validation_2016-05-28
+  validation_date: 2016-05-28
+  force_split: false
+
+model:
+  name: popularity
+  top_k: 7
+
+evaluation:
+  metric: map_at_7
+  target: additional_products
+
+runtime:
+  memory_limit: 2GB
+  temp_directory: /content/santander_duckdb_temp
+
+tracking:
+  mlflow:
+    enabled: true
+    tracking_uri: ${oc.env:MLFLOW_TRACKING_URI,file:./mlruns}
+    experiment_name: ${oc.env:MLFLOW_EXPERIMENT_NAME,santander-baselines}
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: .hydra/runs/${now:%Y-%m-%d}/${now:%H-%M-%S}
