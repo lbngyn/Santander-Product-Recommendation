@@ -44,7 +44,9 @@ def run_competition_test_inference(
         if ownership not in prepared_input:
             raise ValueError(f"Prepared input lacks ownership mask column {ownership!r}.")
         score_frame.loc[pd.to_numeric(prepared_input[ownership], errors="raise").eq(1), product] = float("-inf")
-    ranked = score_frame.apply(lambda row: " ".join(row.nlargest(top_k).index), axis=1)
+    # Do not use masked (-inf) products as padding for customers who own more
+    # than 17 products; a shorter list is preferable to an invalid suggestion.
+    ranked = score_frame.apply(lambda row: " ".join(row[row.ne(float("-inf"))].nlargest(top_k).index), axis=1)
     recommendations = pd.DataFrame({customer_id_column: prepared_input[customer_id_column].to_numpy(), "added_products": ranked.to_numpy()})
     template = pd.read_csv(sample_submission_path)
     if list(template.columns) != [customer_id_column, "added_products"]:

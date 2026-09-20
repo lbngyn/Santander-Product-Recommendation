@@ -9,7 +9,11 @@ from typing import Any, Mapping
 import yaml
 
 from src.features.model_panel import build_model_panel
+from src.inference.predict import load_artifact_metadata
+from src.ingestion.checkpoint import build_interim_checkpoint
 from src.models.lightgbm_binary import train_product_classifiers
+from src.submission.competition import run_competition_test_inference
+from src.submission.prepare import load_competition_input, materialize_competition_test_input
 from src.tracking.progress import PipelineProgress
 from src.tracking.run_context import build_run_manifest, create_run_id, write_run_manifest
 
@@ -51,6 +55,9 @@ def run_lightgbm_v1(config: Mapping[str, Any], *, resolved_config_path: str | Pa
             max_rows_per_product=model.get("max_rows_per_product"),
             random_state=int(model.get("random_state", 42)),
             n_estimators=int(model.get("n_estimators", 300)), n_jobs=int(runtime.get("threads", 1)),
+            memory_limit=runtime.get("memory_limit"), temp_directory=runtime.get("temp_directory"),
+            lightgbm_params=model.get("lightgbm_params"),
+            training_log_period=int(model.get("training_log_period", 5)),
         )
     model_index = artifacts / "model_artifacts.json"
     model_index.write_text(json.dumps(models, indent=2, sort_keys=True), encoding="utf-8")
@@ -77,3 +84,69 @@ def run_lightgbm_v1(config: Mapping[str, Any], *, resolved_config_path: str | Pa
             )
     progress.save()
     return {"run_id": run_id, "description": description, "pipeline_version": version, "model_version": model["version"], "model_panel": str(panel_path), "models": models, "artifacts": str(artifacts), "manifest": str(manifest_path), "mlflow_run_id": mlflow_run_id}
+
+
+def run_lightgbm_v1_competition_from_config(
+    model_index_path: str | Path,
+    config_path: str | Path | None = None,
+) -> Path:
+    """Prepare ``test_ver2.csv`` and create the competition submission.
+
+    ``model_index_path`` is the ``model_artifacts.json`` returned by the
+    training run, keeping the submission tied to a specific immutable run.
+    """
+    index = Path(model_index_path)
+    run_directory = index.parent
+    # Prefer the immutable config copied beside the trained models. This keeps
+    # submission preparation traceable to the exact model run.
+    resolved_config = Path(config_path) if config_path else run_directory / "config_resolved.yaml"
+    if not resolved_config.is_file():
+        raise FileNotFoundError(f"Run config not found: {resolved_config}")
+    config = yaml.safe_load(resolved_config.read_text(encoding="utf-8"))
+    if not isinstance(config, dict):
+        raise ValueError("LightGBM config must be a YAML mapping.")
+    competition = config["competition"]
+    root = Path(os.getenv("SANTANDER_DATA_ROOT", "data"))
+    artifact_directories = json.loads(index.read_text(encoding="utf-8"))
+    if not isinstance(artifact_directories, dict) or len(artifact_directories) != 24:
+        raise ValueError("model_artifacts.json must map exactly 24 products to artifact directories.")
+    metadata = {product: load_artifact_metadata(path) for product, path in artifact_directories.items()}
+    if any(metadata[product].product != product for product in artifact_directories):
+        raise ValueError("A model artifact does not match its product index key.")
+    product_names = list(artifact_directories)
+    feature_names = sorted({name for artifact in metadata.values() for name in artifact.schema.feature_names})
+    runtime = config.get("runtime", {})
+    test_checkpoint = root / competition["interim_test"]
+    build_interim_checkpoint(
+        root / competition["raw_test"], test_checkpoint,
+        chunksize=int(competition.get("chunksize", 50_000)),
+        force_rebuild=bool(competition.get("force_rebuild", False)),
+        show_progress=bool(competition.get("show_progress", True)),
+    )
+    prepared = materialize_competition_test_input(
+        test_checkpoint, root / config["data"]["interim_train"], root / competition["prepared_input"],
+        product_names=product_names, feature_names=feature_names,
+        history_date=str(competition["history_date"]), memory_limit=runtime.get("memory_limit"),
+        temp_directory=runtime.get("temp_directory"),
+    )
+    required_columns = ["ncodpers", *sorted({"prev_" + product for product in product_names}), *feature_names]
+    prepared_frame = load_competition_input(prepared, columns=list(dict.fromkeys(required_columns)))
+    submission = run_competition_test_inference(
+        prepared_frame, root / competition["sample_submission"], artifact_directories,
+        run_directory / "submission.csv", top_k=int(competition.get("top_k", 7)),
+    )
+    (run_directory / "submission_manifest.json").write_text(
+        json.dumps(
+            {
+                "model_index": str(index),
+                "run_config": str(resolved_config),
+                "prepared_input": str(prepared),
+                "sample_submission": str(root / competition["sample_submission"]),
+                "submission": str(submission),
+                "history_date": str(competition["history_date"]),
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return submission

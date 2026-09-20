@@ -37,12 +37,18 @@ class ModelArtifact:
     model_file: str = "model.pkl"
 
 
-def load_artifact(artifact_dir: str | Path) -> tuple[ModelArtifact, Any]:
-    """Load metadata plus a model exposing sklearn-style ``predict_proba``."""
+def load_artifact_metadata(artifact_dir: str | Path) -> ModelArtifact:
+    """Load an artifact contract without materialising its model."""
     directory = Path(artifact_dir)
     metadata = json.loads((directory / "artifact.json").read_text(encoding="utf-8"))
     schema = InputSchema(**metadata["input_schema"])
-    artifact = ModelArtifact(product=metadata["product"], model_version=metadata["model_version"], schema=schema, model_file=metadata.get("model_file", "model.pkl"))
+    return ModelArtifact(product=metadata["product"], model_version=metadata["model_version"], schema=schema, model_file=metadata.get("model_file", "model.pkl"))
+
+
+def load_artifact(artifact_dir: str | Path) -> tuple[ModelArtifact, Any]:
+    """Load metadata plus a model exposing sklearn-style ``predict_proba``."""
+    directory = Path(artifact_dir)
+    artifact = load_artifact_metadata(directory)
     with (directory / artifact.model_file).open("rb") as handle:
         return artifact, pickle.load(handle)
 
