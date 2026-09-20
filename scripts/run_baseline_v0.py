@@ -2,11 +2,19 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sys
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import hydra
 from omegaconf import DictConfig, OmegaConf
+from dotenv import load_dotenv
 
 from src.pipeline.baseline_v0 import run_baseline_v0
+
+load_dotenv(PROJECT_ROOT / ".env")
 
 
 @hydra.main(version_base=None, config_path="../configs/baselines", config_name="v0")

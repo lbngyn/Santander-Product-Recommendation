@@ -1,202 +1,121 @@
 # Santander Product Recommendation
 
-# Overview dataset: 
-- **Provider**: Santander Bank → Product là các dịch vụ liên quan tới tài chính (như là các loại tài khoản, các dịch vụ vay, thuế, credit card)
-- **Dataset**:
-    - Thời gian: `28-01-2015` → `28-05-2016`
-    - Bản ghi các dịch vụ mà người dùng đã đăng kí của cty cùng với các thông tin cá nhân của người dùng.
-- **Target**: tìm các **additional product** của từng customer tại thời điểm `28-06-2016`
+## Mục tiêu
 
-## Memory-safe ingestion
+Xây dựng hệ thống gợi ý sản phẩm ngân hàng từ dữ liệu panel Santander. Target là **additional products**: sản phẩm chuyển từ `0` ở X-1 sang `1` ở X.
 
-The Santander training CSV is too large to assume it fits in a 4 GB local machine. Ingestion is therefore streaming-only: it never loads or concatenates the complete dataset in memory.
-
-What the pipeline does:
-
-- Reads CSV or single-file ZIP input in bounded row chunks.
-- Reads each raw chunk as strings. This prevents pandas from inferring a different type for sparse columns in different chunks (for example, an all-null `conyuemp` chunk versus a later chunk containing `S`/`N`).
-- Normalises each chunk in place, then explicitly casts semantic numeric fields to nullable `Int64`, `Float32`, or `Int8`; all remaining fields are canonical nullable strings.
-- Builds one canonical Arrow schema from the input header (therefore preserving the different train/test column sets) and forces every chunk to that schema before appending it to a Snappy Parquet checkpoint.
-- Validates the finished Parquet schema against the canonical schema, then releases the pandas/Arrow temporary objects. Garbage collection runs periodically.
-- Supports `usecols` in `read_csv_chunks()` for future consumers that truly need only a subset. Full ingest deliberately keeps all source columns to preserve the current checkpoint semantics.
-- Keeps raw/checkpoint paths configurable through `SANTANDER_DATA_ROOT`; Colab bootstrap points this at mounted Drive while local defaults to `data/`.
-
-Default chunk sizes are conservative for the target RAM budgets:
-
-| Runtime | Default | Override |
-| --- | ---: | --- |
-| Local (4 GB) | 50,000 rows | `SANTANDER_CHUNKSIZE` or `config_from_environment(chunksize=...)` |
-| Colab (12 GB) | 150,000 rows | `SANTANDER_CHUNKSIZE` or `config_from_environment(chunksize=...)` |
-
-This bounds peak RAM roughly to the active chunk plus its short-lived pandas/Arrow conversion objects, rather than the full multi-GB CSV. Reading raw values as strings costs some additional memory within one chunk, but prevents schema drift and makes failures deterministic. Exact memory depends on column text length and missingness, so start with the defaults and decrease the chunk size if the runtime approaches its memory limit.
-
-Trade-off: streaming performs more disk I/O and has per-chunk overhead, so it can be slower than a full in-memory load on a high-memory machine. It is intentionally preferred here for reliable ingestion on both 4 GB local CPU and 12 GB Colab CPU.
-
-## Acquisition target features
-
-## Customer-profile preprocessing
-
-`src/data/preprocessing.py` implements the cleaning decisions from
-`docs/customer_profile_feature_deep_eda.md` before any encoding or feature
-engineering. It is intentionally limited to preprocessing:
-
-- keeps observed `age` values unchanged, including values outside 18--90;
-- converts negative `antiguedad` sentinels and negative `renta` to null;
-- uses only an earlier row of the same customer for history filling;
-- fits residual numeric medians and the upper `renta` clipping threshold on a
-  caller-supplied training partition;
-- normalises `indrel_1mes` values `1` and `1.0`, retains categorical null as
-  `__MISSING__`, and drops baseline columns `conyuemp`, `nomprov`,
-  `ult_fec_cli_1t`, and `tipodom`.
-
-Use `fit_profile_preprocessing()` and `transform_customer_profiles()` inside
-each time split. `preprocess_customer_profiles()` is the convenience function
-for producing the final `data/processed/train.parquet` and
-`data/processed/test.parquet` artifacts. It persists the fitted statistics to
-`profile_preprocessing_stats.json` beside the outputs.
-
-The implementation uses DuckDB window functions and Parquet `COPY`, including
-disk spill through a configurable temporary directory. It never materialises
-the customer panel in pandas/RAM. This keeps peak memory bounded by DuckDB's
-configured memory limit at the cost of a disk-backed sort and an additional
-Parquet write. Do not use statistics fit on the full train file to evaluate an
-earlier time-validation fold; fit them only on that fold's historical train
-partition.
-
-## Baseline v0 codebase and reproducibility
-
-The source is organised by responsibility so that alternative preprocessing and
-feature strategies can coexist without duplicating an entire pipeline:
-
-```text
-src/
-├── ingestion/       # public ingest namespace; legacy src/data remains compatible
-├── preprocessing/   # cleaning and missing-value strategies
-├── features/        # acquisition labels and future feature groups
-├── splits/          # time-based split contracts
-├── models/          # training implementations
-├── evaluation/      # ranking metrics and evaluation protocols
-├── tracking/        # Git/config/data lineage and optional MLflow logging
-└── pipeline/        # thin composition of the stages above
-```
-
-The first runnable experiment is [baseline v0](configs/baselines/v0.yaml).
-It starts at the raw files: **raw CSV → interim Parquet → preprocessing**. It
-retains product and categorical columns
-without encoding or feature engineering, cleans negative `antiguedad`/`renta`,
-clips only the upper tail of `renta`, and fills profile values using records of
-the same customer. Numeric gaps with an observed record on each side use the
-arithmetic mean; categorical/date values use the closest customer record;
-residual categories become `__MISSING__` and residual numerics use a train-fit
-median. Its exact stage descriptions are stored alongside its parameters in
-the YAML config.
-
-Run it after interim checkpoints exist:
-
-```powershell
-pip install -r requirements.txt
-python scripts/run_baseline_v0.py --config configs/baselines/v0.yaml
-```
-
-It writes `data/interim/baseline_v0/`, `data/processed/baseline_v0/`, and a per-run lineage manifest to
-`artifacts/runs/<run_id>/lineage_manifest.json`. The manifest contains the
-resolved config, SHA-256 fingerprints of inputs/outputs, and Git commit,
-branch, and dirty-worktree state. Enable `tracking.mlflow.enabled` in the
-config to log the same config and manifest to local MLflow (`mlruns/`). DVC can
-reproduce the declared stage with `dvc repro` after `dvc init`; configure a
-remote (for example the existing GCS bucket) before sharing large artifacts.
-
-Warning: `allow_future_values_within_train: true` is an offline data-repair
-setting requested for baseline v0. It averages a missing training record with
-an observation after it. Set it to `false` before time-based validation or
-production scoring; otherwise it leaks future customer information. Test data
-is always transformed past-only.
-
-`src/features/acquisition.py` builds `acq_<product_column>` targets in
-`data/processed/train.parquet`.  For every customer record, a target is `1`
-only when the product changes from `0` in that customer's nearest earlier
-record to `1` in the current record; all other cases, including a customer's
-first record, are `0`.  Each target is stored as Parquet `TINYINT`.
-
-The feature step uses DuckDB window functions and writes Parquet directly to a
-temporary file before an atomic replace. This avoids loading the full panel
-into pandas/RAM, at the cost of a disk-backed sort and one processed Parquet
-write. `data/processed/test.parquet` is also copied once as the canonical test
-checkpoint; it has no acquisition targets because Santander test data has no
-product-state columns.
-
-## VS Code → Colab CPU: runtime config bundle
-
-Khi notebook chạy từ VS Code nhưng dùng Colab CPU, Colab Secrets không truy cập được. Bootstrap hỗ trợ một bundle Base64 duy nhất thay cho việc nhập từng credential.
-
-Tạo `secrets/colab_runtime_config.json` (thư mục `secrets/` đã được Git ignore) với các key bắt buộc:
-
-```json
-{
-  "GITHUB_TOKEN": "github_pat_...",
-  "GCP_SERVICE_ACCOUNT_JSON": { "type": "service_account" },
-  "GOOGLE_CLOUD_PROJECT": "your-project-id",
-  "GCS_BUCKET": "your-bucket",
-  "GCS_RAW_PREFIX": "santander/raw",
-  "GCS_CHECKPOINT_PREFIX": "santander/interim"
-}
-```
-
-`GCP_SERVICE_ACCOUNT_JSON` phải là toàn bộ JSON object trong service-account key, không chỉ phần `type` trong ví dụ.
-
-Tạo Base64 một dòng và copy thẳng vào clipboard trên Windows PowerShell:
-
-```powershell
-$bundle = Get-Content -Raw "secrets\colab_runtime_config.json"
-[Convert]::ToBase64String(
-  [System.Text.Encoding]::UTF8.GetBytes($bundle)
-) | Set-Clipboard
-```
-
-Chạy bootstrap cell trong notebook Colab rồi paste tại prompt `COLAB_RUNTIME_CONFIG_B64`. Bundle chỉ được giữ trong RAM của runtime hiện tại. Sau khi paste, xoá clipboard:
-
-
-```powershell
-Set-Clipboard -Value ""
-```
-
-Không commit file config, service-account JSON, GitHub PAT, Base64 bundle, hoặc output cell có secret. Nếu extension hỗ trợ environment variable cho remote kernel, đặt `COLAB_RUNTIME_CONFIG_B64` để bootstrap không cần hỏi prompt.
+Baseline v0 là popularity baseline: xếp hạng sản phẩm theo lượt mua mới trong lịch sử, loại sản phẩm customer đã sở hữu ở X-1, rồi gợi ý tối đa 7 sản phẩm.
 
 ## Cấu trúc
 
 ```text
-.
-├── configs/                 # Config versioned theo baseline/experiment
-├── data/
-│   ├── raw/                 # Dữ liệu Kaggle gốc — không commit
-│   ├── interim/             # Dữ liệu tạm sau làm sạch — không commit
-│   └── processed/           # Feature/model-ready data — không commit
-├── docs/                    # Project plan, data dictionary, báo cáo kỹ thuật
-├── notebooks/               # EDA, thử nghiệm, trình bày kết quả
-├── reports/
-│   └── figures/             # Biểu đồ và hình cho báo cáo
-├── src/
-│   ├── data/                # Legacy-compatible ingest/schema implementation
-│   ├── ingestion/           # Public namespace của ingestion
-│   ├── preprocessing/       # Cleaning và missing-value strategies
-│   ├── features/            # Acquisition labels và feature engineering
-│   ├── splits/              # Time-based data splits
-│   ├── models/              # Model training (chưa có model ở v0)
-│   ├── evaluation/          # Evaluation protocol/metrics
-│   ├── tracking/            # Git/config/data lineage + MLflow adapter
-│   └── pipeline/            # Composition của các domain stage
-├── tests/
-│   ├── unit/                # Test từng hàm/module
-│   └── integration/         # Test flow end-to-end với sample nhỏ
-├── scripts/                 # Entry point chạy ingest/train/evaluate
-└── artifacts/               # Model, metric, prediction sinh ra — không commit
+configs/       # Hydra config
+notebooks/     # Bootstrap và gọi pipeline
+scripts/       # Entry point
+src/           # Logic ingest, split, preprocessing, model, evaluation
+data/          # Cache local/Drive, không commit
+artifacts/     # Output run, không commit
 ```
 
-Các thư mục rỗng được giữ trong Git bằng `.gitkeep`.
+## Cài đặt local
 
-## Cách sử dụng codebase
+```powershell
+conda activate vsf-side-project
+pip install -r requirements.txt
+```
 
-1. Đặt file CSV Kaggle vào `data/raw/`. Dữ liệu này đã được ignore, không commit lên Git.
-2. Đặt đường dẫn dữ liệu và tham số chạy vào `configs/`; không hard-code path hoặc secret trong source code.
-3. Đặt strategy mới trong domain phù hợp (ví dụ `src/preprocessing/`), chọn strategy qua config, rồi để manifest/MLflow ghi lại run.
-4. Lưu biểu đồ/báo cáo tĩnh ở `reports/`; lưu output có thể tạo lại ở `data/processed/` hoặc `artifacts/`.
+Tạo `.env` từ `.env.example`. Không commit `.env`, credential, PAT hoặc Base64 runtime bundle.
+
+```dotenv
+GCP_SERVICE_ACCOUNT_JSON={"type":"service_account",...}
+GOOGLE_CLOUD_PROJECT=your-project
+GCS_BUCKET=your-bucket
+GCS_RAW_PREFIX=santander/raw
+GCS_CHECKPOINT_PREFIX=santander/checkpoints
+SANTANDER_DATA_ROOT=data
+SANTANDER_DUCKDB_TEMP_DIRECTORY=data/.duckdb_tmp
+MLFLOW_TRACKING_URI=sqlite:///absolute/path/to/mlflow.db
+MLFLOW_EXPERIMENT_NAME=santander-baselines
+DVC_REMOTE_URL=gs://your-bucket/santander/dvc
+```
+
+Nếu dùng `GCP_SERVICE_ACCOUNT_JSON`, không đặt `GOOGLE_APPLICATION_CREDENTIALS` thành một đường dẫn giả. Chỉ dùng biến đó khi file service-account thực sự tồn tại.
+
+## Chạy baseline v0
+
+```powershell
+conda run -n vsf-side-project python scripts/run_baseline_v0.py
+```
+
+Hydra override, ví dụ ép tạo lại fixed split:
+
+```powershell
+conda run -n vsf-side-project python scripts/run_baseline_v0.py split.force_split=true
+```
+
+Pipeline chạy theo thứ tự:
+
+```text
+GCS/raw cache → ingest → fixed temporal split → preprocessing
+→ popularity train/evaluate → artifact local/Drive → upload GCS
+```
+
+CSV được ingest theo chunk; DuckDB xử lý Parquet và window function với memory limit/spill directory. Popularity v0 chạy CPU/DuckDB; GPU không được dùng ở baseline này.
+
+## Fixed temporal split
+
+Validation cố định tại `2016-05-28`, dùng chung cho tất cả pipeline:
+
+```text
+<SANTANDER_DATA_ROOT>/interim/splits/validation_2016-05-28/
+├── train.parquet
+├── validation_input.parquet
+└── validation_target.parquet
+```
+
+- `train.parquet`: record trước validation date.
+- `validation_input.parquet`: profile tại X và `prev_<product>` từ X-1; không có 24 product columns tại X.
+- `validation_target.parquet`: 24 product columns thật tại X.
+
+Model sau phải fit transform/model trên `train.parquet`, sau đó transform `validation_input.parquet`; không fit statistics trên validation.
+
+## Output run
+
+```text
+<SANTANDER_DATA_ROOT>/artifacts/runs/<run_id>/
+├── config_resolved.yaml
+├── lineage_manifest.json
+├── popularity_ranking.parquet
+├── validation_predictions.parquet
+└── metrics.json
+```
+
+Pipeline in tiến độ theo stage. Lịch sử timing được lưu tại `artifacts/runs/pipeline_timing.json`; ETA chỉ có sau ít nhất một run hoàn tất.
+
+## Colab
+
+Chạy bootstrap trong `notebooks/baseline_v0_popularity.ipynb`. Bootstrap lấy config từ Colab Secrets hoặc `COLAB_RUNTIME_CONFIG_B64`, mount Drive, đặt `SANTANDER_DATA_ROOT`, sync source và cài dependency. Branch được bootstrap chọn phải được commit/push trước khi Colab sync.
+
+## Hydra, MLflow và DVC
+
+- Hydra: config chính là `configs/baselines/v0.yaml`; override bằng command line.
+- MLflow: log config, metric và artifact tại `MLFLOW_TRACKING_URI`. Dùng SQLite backend, ví dụ `sqlite:///E:/path/to/mlflow.db`; mở UI bằng `mlflow ui --backend-store-uri <URI> --port 5000`.
+- DVC: cần khởi tạo/config remote riêng trước khi dùng: `dvc init`, sau đó cấu hình `DVC_REMOTE_URL`.
+
+## Lỗi GCS OAuth `WinError 10013`
+
+Nếu log báo `WinError 10013` khi gọi `oauth2.googleapis.com/token`, Windows, proxy, VPN, antivirus hoặc firewall đang chặn Python kết nối HTTPS outbound. Đây là lỗi network/permission, không phải lỗi dataset.
+
+Kiểm tra:
+
+```powershell
+Test-NetConnection oauth2.googleapis.com -Port 443
+Test-NetConnection storage.googleapis.com -Port 443
+```
+
+Cho phép Python của conda outbound HTTPS/443 hoặc cấu hình proxy theo chính sách mạng. Khi raw/checkpoint đã có local, có thể debug không upload GCS:
+
+```powershell
+conda run -n vsf-side-project python scripts/run_baseline_v0.py `
+  storage.upload_checkpoints=false storage.upload_artifacts=false
+```

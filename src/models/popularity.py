@@ -15,6 +15,7 @@ def run_popularity_baseline(
     top_k: int = 7,
     memory_limit: str | None = None,
     temp_directory: str | Path | None = None,
+    threads: int | None = None,
 ) -> dict[str, object]:
     """Score a temporal holdout using only product acquisitions before it.
 
@@ -26,14 +27,16 @@ def run_popularity_baseline(
     date are written separately as the target, so they cannot enter scoring.
     """
     source, destination = Path(train_path), Path(output_dir)
+    scratch_dir = Path(temp_directory) if temp_directory else destination
     if not source.is_file():
         raise FileNotFoundError(f"Train checkpoint not found: {source}")
     if top_k < 1:
         raise ValueError("top_k must be positive.")
     destination.mkdir(parents=True, exist_ok=True)
+    scratch_dir.mkdir(parents=True, exist_ok=True)
     con = duckdb.connect(database=":memory:")
     try:
-        _configure(con, memory_limit, temp_directory)
+        _configure(con, memory_limit, temp_directory, threads)
         columns = _columns(con, source)
         products = [column for column in columns if column.endswith("_ult1")]
         if not products:
@@ -49,14 +52,9 @@ def run_popularity_baseline(
         current_product_values = ",\n                    ".join(
             f"('{product}', TRY_CAST(\"{product}\" AS TINYINT), TRY_CAST(\"previous_{product}\" AS TINYINT))" for product in products
         )
-        previous_product_values = ", ".join(
-            f"('{product}', TRY_CAST(h.\"previous_{product}\" AS TINYINT))" for product in products
-        )
-        profile_columns = [column for column in columns if column not in {"ncodpers", "fecha_dato", *products}]
-        profile_projection = ", ".join(f'current."{column}"' for column in profile_columns)
-        profile_projection = (", " + profile_projection) if profile_projection else ""
-        target_projection = ", ".join(f'"{product}"' for product in products)
-
+        ownership_case = "CASE p.product " + " ".join(
+            f"WHEN '{product}' THEN TRY_CAST(h.\"previous_{product}\" AS TINYINT)" for product in products
+        ) + " ELSE 0 END"
         common = f"""
             WITH ordered AS (
                 SELECT *, LAG(fecha_dato) OVER customer_time AS previous_date,
@@ -81,16 +79,14 @@ def run_popularity_baseline(
             )
         """
         _copy(con, common + "SELECT product, new_purchase_count, popularity_rank FROM popularity ORDER BY popularity_rank", destination / "popularity_ranking.parquet")
-        _copy(con, common + f"SELECT ncodpers, fecha_dato{profile_projection.replace('current.', '')}, {', '.join(f'COALESCE(TRY_CAST("previous_{p}" AS TINYINT), 0) AS "prev_{p}"' for p in products)} FROM holdout", destination / "validation_input.parquet")
-        _copy(con, common + f"SELECT ncodpers, fecha_dato, {target_projection} FROM holdout", destination / "validation_target.parquet")
+        actual_path = scratch_dir / "validation_actual_additions.parquet"
         _copy(con, common + f"""
             , eligible AS (
                 SELECT h.ncodpers, h.fecha_dato, p.product, p.popularity_rank,
                        ROW_NUMBER() OVER (PARTITION BY h.ncodpers ORDER BY p.popularity_rank) AS recommendation_rank
                 FROM holdout AS h
                 CROSS JOIN popularity AS p
-                CROSS JOIN LATERAL (VALUES {previous_product_values}) AS state(product, owned)
-                WHERE state.product = p.product AND COALESCE(state.owned, 0) = 0
+                WHERE COALESCE({ownership_case}, 0) = 0
             )
             SELECT ncodpers, fecha_dato,
                    string_agg(p.product, ' ' ORDER BY p.popularity_rank) AS added_products
@@ -104,8 +100,9 @@ def run_popularity_baseline(
             CROSS JOIN LATERAL (VALUES {current_product_values}) AS product_values(product, value, previous_value)
             WHERE product_values.value = 1 AND COALESCE(product_values.previous_value, 0) = 0
             GROUP BY h.ncodpers, h.fecha_dato
-        """, destination / "validation_actual_additions.parquet")
-        metrics = _map_at_k(con, destination / "validation_predictions.parquet", destination / "validation_actual_additions.parquet", validation_rows, top_k)
+        """, actual_path)
+        metrics = _map_at_k(con, destination / "validation_predictions.parquet", actual_path, validation_rows, top_k)
+        actual_path.unlink(missing_ok=True)
         metrics.update({"validation_date": validation_date, "top_k": top_k, "validation_customers": validation_rows})
         metrics_path = destination / "metrics.json"
         metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
@@ -142,8 +139,10 @@ def _copy(con: duckdb.DuckDBPyConnection, query: str, destination: Path) -> None
     temporary.replace(destination)
 
 
-def _configure(con: duckdb.DuckDBPyConnection, memory_limit: str | None, temp_directory: str | Path | None) -> None:
+def _configure(con: duckdb.DuckDBPyConnection, memory_limit: str | None, temp_directory: str | Path | None, threads: int | None) -> None:
     if memory_limit: con.execute(f"SET memory_limit = '{memory_limit}'")
+    if threads: con.execute(f"SET threads = {threads}")
+    con.execute("SET preserve_insertion_order = false")
     if temp_directory:
         path = Path(temp_directory); path.mkdir(parents=True, exist_ok=True)
         con.execute(f"SET temp_directory = '{_path(path)}'")

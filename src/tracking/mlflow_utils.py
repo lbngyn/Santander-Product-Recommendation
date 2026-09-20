@@ -11,7 +11,7 @@ def log_baseline_run(*, experiment_name: str, tracking_uri: str, manifest_path: 
         import mlflow
     except ImportError as error:  # pragma: no cover - depends on optional package
         raise RuntimeError("MLflow tracking is enabled but mlflow is not installed. Run: pip install -r requirements.txt") from error
-    mlflow.set_tracking_uri(tracking_uri)
+    mlflow.set_tracking_uri(_normalise_tracking_uri(tracking_uri))
     mlflow.set_experiment(experiment_name)
     with mlflow.start_run() as run:
         mlflow.set_tags({key: str(value) for key, value in tags.items() if value is not None})
@@ -21,3 +21,14 @@ def log_baseline_run(*, experiment_name: str, tracking_uri: str, manifest_path: 
         mlflow.log_artifact(str(manifest_path), artifact_path="lineage")
         mlflow.log_artifacts(str(artifact_dir), artifact_path="artifacts")
         return run.info.run_id
+
+
+def _normalise_tracking_uri(value: str) -> str:
+    """Use SQLite for local tracking because MLflow no longer enables file stores."""
+    if value.startswith("file:") and not value.startswith("file://"):
+        database = Path(value.removeprefix("file:")).resolve().with_suffix(".db")
+        return f"sqlite:///{database.as_posix()}"
+    if value.startswith("file://"):
+        database = Path(value.removeprefix("file://")).resolve().with_suffix(".db")
+        return f"sqlite:///{database.as_posix()}"
+    return value

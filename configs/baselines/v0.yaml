@@ -46,7 +46,10 @@ evaluation:
 
 runtime:
   memory_limit: 2GB
-  temp_directory: /content/santander_duckdb_temp
+  threads: 1
+  # Local default. Colab bootstrap overrides this with /content/... so DuckDB
+  # spills to fast ephemeral disk instead of mounted Drive.
+  temp_directory: ${oc.env:SANTANDER_DUCKDB_TEMP_DIRECTORY,data/.duckdb_tmp}
 
 tracking:
   mlflow:

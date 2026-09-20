@@ -32,7 +32,8 @@ def build_validation_split(
         if memory_limit: con.execute(f"SET memory_limit = '{memory_limit}'")
         if temp_directory:
             temp = Path(temp_directory); temp.mkdir(parents=True, exist_ok=True)
-            con.execute(f"SET temp_directory = '{str(temp).replace("'", "''")}'")
+            escaped_temp = str(temp).replace("'", "''")
+            con.execute(f"SET temp_directory = '{escaped_temp}'")
         columns = [row[0] for row in con.execute("DESCRIBE SELECT * FROM read_parquet(?)", [str(source)]).fetchall()]
         products = [column for column in columns if column.endswith("_ult1")]
         if not products: raise ValueError("Source checkpoint has no product columns.")
@@ -40,14 +41,15 @@ def build_validation_split(
         previous = ", ".join(f"COALESCE(TRY_CAST(\"previous_{p}\" AS TINYINT), 0) AS \"prev_{p}\"" for p in products)
         profile_sql = ", ".join(f"\"{column}\"" for column in profiles)
         target_sql = ", ".join(f"\"{column}\"" for column in products)
+        escaped_source = str(source).replace("'", "''")
         ordered = f"""WITH ordered AS (
             SELECT *, {', '.join(f'LAG("{p}") OVER customer_time AS "previous_{p}"' for p in products)}
-            FROM read_parquet('{str(source).replace("'", "''")}')
+            FROM read_parquet('{escaped_source}')
             WINDOW customer_time AS (PARTITION BY ncodpers ORDER BY fecha_dato)
         )"""
-        _copy(con, f"SELECT * FROM read_parquet('{str(source).replace("'", "''")}') WHERE CAST(fecha_dato AS DATE) < CAST('{validation_date}' AS DATE)", train)
+        _copy(con, f"SELECT * FROM read_parquet('{escaped_source}') WHERE CAST(fecha_dato AS DATE) < CAST('{validation_date}' AS DATE)", train)
         _copy(con, ordered + f" SELECT ncodpers, fecha_dato{', ' if profile_sql else ''}{profile_sql}, {previous} FROM ordered WHERE CAST(fecha_dato AS DATE) = CAST('{validation_date}' AS DATE)", validation_input)
-        _copy(con, f"SELECT ncodpers, fecha_dato, {target_sql} FROM read_parquet('{str(source).replace("'", "''")}') WHERE CAST(fecha_dato AS DATE) = CAST('{validation_date}' AS DATE)", validation_target)
+        _copy(con, f"SELECT ncodpers, fecha_dato, {target_sql} FROM read_parquet('{escaped_source}') WHERE CAST(fecha_dato AS DATE) = CAST('{validation_date}' AS DATE)", validation_target)
     finally:
         con.close()
     return {"train": str(train), "validation_input": str(validation_input), "validation_target": str(validation_target), "status": "rebuilt"}
@@ -56,5 +58,6 @@ def build_validation_split(
 def _copy(con: duckdb.DuckDBPyConnection, query: str, destination: Path) -> None:
     temporary = destination.with_suffix(destination.suffix + ".tmp")
     if temporary.exists(): temporary.unlink()
-    con.execute(f"COPY ({query}) TO '{str(temporary).replace("'", "''")}' (FORMAT PARQUET, COMPRESSION ZSTD)")
+    escaped_temporary = str(temporary).replace("'", "''")
+    con.execute(f"COPY ({query}) TO '{escaped_temporary}' (FORMAT PARQUET, COMPRESSION ZSTD)")
     temporary.replace(destination)
