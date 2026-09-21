@@ -1,5 +1,5 @@
 pipeline:
-  version: lightgbm-acquisition-v1
+  version: lightgbm-acquisition-v2
   description: >-
     24 independent LightGBM binary acquisition classifiers. Customer profile
     values use month t; product ownership inputs use only t-1.
@@ -7,7 +7,7 @@ pipeline:
 data:
   # Relative to SANTANDER_DATA_ROOT.
   interim_train: interim/train.parquet
-  model_panel: processed/lightgbm_v1/model_panel.parquet
+  model_panel: processed/lightgbm_v1/model_panel_history_v2.parquet
   artifact_dir: artifacts
 
 competition:
@@ -30,7 +30,7 @@ features:
   force_process: false
 
 model:
-  version: lightgbm-binary-v1
+  version: lightgbm-binary-v2-history
   # Fast smoke-run setting: 24 independent models, 20 trees each.
   n_estimators: 20
   random_state: 42

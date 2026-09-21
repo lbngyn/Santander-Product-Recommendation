@@ -107,8 +107,10 @@ class UnifiedProductDatasetBuilder:
                 self.temp_directory.mkdir(parents=True, exist_ok=True)
                 escaped_directory = str(self.temp_directory).replace("'", "''")
                 con.execute(f"SET temp_directory = '{escaped_directory}'")
-            query = "COPY (" + " UNION ALL ".join(branches) + ") TO ? (FORMAT PARQUET, COMPRESSION ZSTD)"
-            con.execute(query, [str(self.model_panel_path)] * len(branches) + [str(temporary)])
+            source_sql = str(self.model_panel_path).replace("'", "''")
+            output_sql = str(temporary).replace("'", "''")
+            query = "COPY (" + " UNION ALL ".join(branches) + f") TO '{output_sql}' (FORMAT PARQUET, COMPRESSION ZSTD)"
+            con.execute(query.replace("read_parquet(?)", f"read_parquet('{source_sql}')"))
         finally:
             con.close()
         temporary.replace(destination)

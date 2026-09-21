@@ -13,6 +13,9 @@ import pandas as pd
 from src.inference.predict import InputSchema, ModelArtifact, write_artifact_metadata
 
 
+MODEL_METADATA_COLUMNS = {"ncodpers", "fecha_dato", "previous_observation"}
+
+
 def train_product_classifiers(
     model_panel_path: str | Path,
     artifact_root: str | Path,
@@ -56,8 +59,11 @@ def train_product_classifiers(
         products = [c.removeprefix("acq_") for c in columns if c.startswith("acq_")]
         if len(products) != 24:
             raise ValueError(f"Expected 24 acquisition labels, found {len(products)}.")
-        default_features = [c for c in columns if c not in {"ncodpers", "fecha_dato", "previous_observation", *["acq_" + p for p in products]}]
+        default_features = [c for c in columns if c not in { *MODEL_METADATA_COLUMNS, *["acq_" + p for p in products]}]
         selected = list(feature_names or default_features)
+        forbidden = set(selected).intersection(MODEL_METADATA_COLUMNS)
+        if forbidden:
+            raise ValueError(f"Metadata columns cannot be model features: {sorted(forbidden)}")
         missing = set(selected).difference(columns)
         if missing:
             raise ValueError(f"Requested features missing from model panel: {sorted(missing)}")
@@ -66,9 +72,11 @@ def train_product_classifiers(
         result: dict[str, str] = {}
         training_started = time.perf_counter()
         for model_number, product in enumerate(products, start=1):
-            # Eligibility is product-specific: only 0 -> {0,1} transitions.
+            # Eligibility is product-specific and only admits an observed
+            # adjacent-month 0 -> {0,1} transition.  A gap cannot safely be
+            # interpreted as a monthly non-acquisition.
             projection = ", ".join(_quote(c) for c in [*selected, "acq_" + product])
-            eligibility = f'previous_observation = 1 AND COALESCE({_quote("prev_" + product)}, 0) = 0'
+            eligibility = f'record_gap_months = 1 AND COALESCE({_quote("prev_" + product)}, 0) = 0'
             query = f'SELECT {projection} FROM read_parquet(?) WHERE {eligibility}'
             if max_rows_per_product:
                 query += f" LIMIT {int(max_rows_per_product)}"

@@ -19,10 +19,28 @@ from src.models.lightgbm_joint import (
     rank_joint_candidates,
     train_joint_classifier,
 )
+from src.models.lightgbm_joint_native import CompactJointDatasetBuilder, benchmark_native_joint_training
+from src.models.xgboost_joint_external import benchmark_xgboost_external_joint_training
 from src.products import PRODUCT_COLUMNS, PRODUCT_NAME_BY_ID, categorical_product_id
 from src.submission.competition import run_ranked_candidate_submission
 from src.submission.prepare import load_competition_input, materialize_competition_test_input
 from src.tracking.run_context import build_run_manifest, create_run_id, write_run_manifest
+
+
+# All non-temporal customer/persona columns in the existing model panel.
+# The two raw dates are excluded: unlike the 20 static/persona fields below,
+# they have no existing numeric/categorical model representation.
+PERSONA_FEATURES = (
+    "ind_empleado", "pais_residencia", "sexo", "age", "ind_nuevo",
+    "antiguedad", "indrel", "indrel_1mes", "tiprel_1mes", "indresi",
+    "indext", "conyuemp", "canal_entrada", "indfall", "tipodom",
+    "cod_prov", "nomprov", "ind_actividad_cliente", "renta", "segmento",
+)
+CATEGORICAL_PERSONA_FEATURES = (
+    "ind_empleado", "pais_residencia", "sexo", "indrel_1mes",
+    "tiprel_1mes", "indresi", "indext", "conyuemp", "canal_entrada",
+    "indfall", "nomprov", "segmento",
+)
 
 
 def run_lightgbm_joint_v1_from_config(
@@ -34,6 +52,71 @@ def run_lightgbm_joint_v1_from_config(
     if not isinstance(config, dict):
         raise ValueError("Joint LightGBM config must be a YAML mapping.")
     return run_lightgbm_joint_v1(config, resolved_config_path=path)
+
+
+def run_lightgbm_joint_native_benchmark_from_config(
+    config_path: str | Path = "configs/baselines/lightgbm_joint_v1.yaml",
+) -> dict[str, Any]:
+    """Benchmark native Dataset construction/training without full expansion."""
+    path = Path(config_path)
+    config = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if not isinstance(config, dict):
+        raise ValueError("Joint LightGBM config must be a YAML mapping.")
+    data, model = config["data"], config["model"]
+    runtime, split = config.get("runtime", {}), config["split"]
+    native = config.get("native_training", {})
+    limits = [int(value) for value in native.get("benchmark_compact_row_limits", [])]
+    if not limits:
+        raise ValueError("native_training.benchmark_compact_row_limits is required for a benchmark.")
+    root = Path(os.getenv("SANTANDER_DATA_ROOT", "data"))
+    temp_directory = os.getenv("SANTANDER_DUCKDB_TEMP_DIRECTORY", str(runtime.get("temp_directory", "data/.duckdb_tmp")))
+    panel = build_model_panel(root / data["interim_train"], root / data["model_panel"], force_process=bool(config.get("features", {}).get("force_process", False)), memory_limit=runtime.get("memory_limit"), temp_directory=temp_directory)
+    features = _joint_feature_names(panel)
+    run_id = create_run_id(str(config["pipeline"]["version"]) + "-native-benchmark")
+    output = root / data["artifact_dir"] / "runs" / run_id
+    input_dtypes = _feature_dtypes(panel, features)
+    results = benchmark_native_joint_training(
+        CompactJointDatasetBuilder(panel, memory_limit=runtime.get("memory_limit"), temp_directory=temp_directory), output,
+        feature_names=features, input_dtypes=input_dtypes, train_months=_months_before(panel, str(split["validation_date"])),
+        compact_row_limits=limits, batch_customer_months=int(native.get("batch_customer_months", 25_000)),
+        model_version=str(model["version"]), random_state=int(model.get("random_state", 42)), n_jobs=int(runtime.get("threads", 1)), categorical_feature_names=CATEGORICAL_PERSONA_FEATURES, lightgbm_params=model.get("lightgbm_params"),
+    )
+    return {"run_id": run_id, "artifacts": str(output), "benchmarks": results}
+
+
+def run_xgboost_joint_external_benchmark_from_config(
+    config_path: str | Path = "configs/baselines/lightgbm_joint_v1.yaml",
+) -> dict[str, Any]:
+    """Benchmark one 100-tree shared XGBoost model with external-memory pages."""
+    path = Path(config_path)
+    config = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if not isinstance(config, dict):
+        raise ValueError("Joint XGBoost config must be a YAML mapping.")
+    data, runtime, model, competition = config["data"], config.get("runtime", {}), config.get("xgboost_external", {}), config["competition"]
+    limits = [int(value) for value in model.get("benchmark_compact_row_limits", [])]
+    if not limits:
+        raise ValueError("xgboost_external.benchmark_compact_row_limits is required.")
+    root = Path(os.getenv("SANTANDER_DATA_ROOT", "data"))
+    temp_directory = Path(os.getenv("SANTANDER_DUCKDB_TEMP_DIRECTORY", str(runtime.get("temp_directory", "data/.duckdb_tmp"))))
+    panel = build_model_panel(root / data["interim_train"], root / data["model_panel"], force_process=bool(config.get("features", {}).get("force_process", False)), memory_limit=runtime.get("memory_limit"), temp_directory=temp_directory)
+    features = _joint_feature_names(panel)
+    run_id = create_run_id(str(config["pipeline"]["version"]) + "-xgboost-external-benchmark")
+    output = root / data["artifact_dir"] / "runs" / run_id
+    results = benchmark_xgboost_external_joint_training(
+        CompactJointDatasetBuilder(panel, memory_limit=runtime.get("memory_limit"), temp_directory=temp_directory), output,
+        feature_names=features, input_dtypes=_feature_dtypes(panel, features), train_months=_months_before(panel, str(config["split"]["validation_date"])),
+        compact_row_limits=limits, expand_batch_customer_months=int(model.get("expand_batch_customer_months", 25_000)),
+        xgboost_batch_rows=int(model.get("xgboost_batch_rows", 250_000)), cache_directory=temp_directory / "xgboost_external_cache" / run_id,
+        model_version=str(model.get("version", "xgboost-joint-external-v1")), random_state=int(model.get("random_state", 42)), n_jobs=int(runtime.get("threads", 1)),
+        categorical_feature_names=CATEGORICAL_PERSONA_FEATURES, work_directory=temp_directory / "xgboost_external_work" / run_id, xgboost_params=model.get("params"),
+    )
+    submission = None
+    if bool(model.get("generate_submission", True)):
+        submission = _competition_submission(
+            root, root / data["interim_train"], output, Path(results[-1]["artifact_directory"]),
+            features, runtime, competition,
+        )
+    return {"run_id": run_id, "artifacts": str(output), "benchmarks": results, "submission": str(submission) if submission else None}
 
 
 def run_lightgbm_joint_v1(
@@ -82,7 +165,7 @@ def run_lightgbm_joint_v1(
     manifest = build_run_manifest(
         run_id=run_id, config=config,
         inputs={"interim_train": root / data["interim_train"], "model_panel": panel_path},
-        outputs={"joint_model": artifact_directory, "validation_metrics": validation_path, "submission": submission, "config": resolved_copy},
+        outputs={"joint_model": artifact_directory / "model.pkl", "validation_metrics": validation_path, "submission": submission, "config": resolved_copy},
     )
     manifest_path = write_run_manifest(manifest, run_directory / "lineage_manifest.json")
     return {"run_id": run_id, "artifacts": str(run_directory), "model": training, "validation": validation, "submission": str(submission), "manifest": str(manifest_path)}
@@ -100,6 +183,29 @@ def _numeric_feature_names(panel_path: Path) -> list[str]:
     if not features:
         raise ValueError("Existing model panel contains no numeric/encoded model features.")
     return features
+
+
+def _joint_feature_names(panel_path: Path) -> list[str]:
+    """Return 20 customer/persona fields plus all 24 prior-product states."""
+    con = duckdb.connect(database=":memory:")
+    try:
+        columns = {row[0] for row in con.execute("DESCRIBE SELECT * FROM read_parquet(?)", [str(panel_path)]).fetchall()}
+    finally:
+        con.close()
+    requested = [*PERSONA_FEATURES, *["prev_" + product for product in PRODUCT_COLUMNS]]
+    missing = sorted(set(requested).difference(columns))
+    if missing:
+        raise ValueError(f"Model panel is missing requested joint-model features: {missing}")
+    return requested
+
+
+def _feature_dtypes(panel_path: Path, features: list[str]) -> dict[str, str]:
+    con = duckdb.connect(database=":memory:")
+    try:
+        sample = con.execute("SELECT * FROM read_parquet(?) LIMIT 1", [str(panel_path)]).fetchdf()
+    finally:
+        con.close()
+    return {name: str(sample[name].dtype) for name in features}
 
 
 def _months_before(panel_path: Path, validation_date: str) -> list[str]:
