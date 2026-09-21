@@ -20,6 +20,7 @@ def train_product_classifiers(
     feature_names: Sequence[str] | None = None,
     model_version: str = "lightgbm-binary-v1",
     max_rows_per_product: int | None = None,
+    max_negative_rows_per_product: int | None = None,
     random_state: int = 42,
     n_estimators: int = 300,
     n_jobs: int = 1,
@@ -66,10 +67,23 @@ def train_product_classifiers(
         training_started = time.perf_counter()
         for model_number, product in enumerate(products, start=1):
             # Eligibility is product-specific: only 0 -> {0,1} transitions.
-            query = f'SELECT {", ".join(_quote(c) for c in [*selected, "acq_" + product])} FROM read_parquet(?) WHERE previous_observation = 1 AND COALESCE({_quote("prev_" + product)}, 0) = 0'
+            projection = ", ".join(_quote(c) for c in [*selected, "acq_" + product])
+            eligibility = f'previous_observation = 1 AND COALESCE({_quote("prev_" + product)}, 0) = 0'
+            query = f'SELECT {projection} FROM read_parquet(?) WHERE {eligibility}'
             if max_rows_per_product:
                 query += f" LIMIT {int(max_rows_per_product)}"
-            frame = con.execute(query, [str(source)]).fetchdf()
+            elif max_negative_rows_per_product:
+                label = _quote("acq_" + product)
+                # Keep every rare acquisition and cap only negatives. A plain
+                # LIMIT can discard all positives for low-incidence products.
+                query = (
+                    f'SELECT {projection} FROM read_parquet(?) WHERE {eligibility} AND {label} = 1 '
+                    f'UNION ALL '
+                    f'SELECT {projection} FROM (SELECT {projection} FROM read_parquet(?) '
+                    f'WHERE {eligibility} AND {label} = 0 LIMIT {int(max_negative_rows_per_product)})'
+                )
+            parameters = [str(source), str(source)] if max_negative_rows_per_product and not max_rows_per_product else [str(source)]
+            frame = con.execute(query, parameters).fetchdf()
             # The baseline deliberately uses numeric prepared features.  A
             # categorical pipeline may pass its encoded feature_names instead;
             # retaining raw object columns here would make the model artifact

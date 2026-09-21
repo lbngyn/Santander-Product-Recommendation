@@ -83,7 +83,7 @@ def materialize_competition_test_input(
         con.close()
 
 
-def load_competition_input(path: str | Path, *, columns: Sequence[str]) -> object:
+def load_competition_input(path: str | Path, *, columns: Sequence[str], dtypes: dict[str, str] | None = None) -> object:
     """Read only the artifact-required columns to a pandas frame for scoring."""
     con = duckdb.connect(database=":memory:")
     try:
@@ -91,7 +91,10 @@ def load_competition_input(path: str | Path, *, columns: Sequence[str]) -> objec
         missing = set(columns).difference(available)
         if missing:
             raise ValueError(f"Prepared competition input lacks columns: {sorted(missing)}")
-        return con.execute(f"SELECT {', '.join(_quote(column) for column in columns)} FROM read_parquet(?)", [str(path)]).fetchdf()
+        frame = con.execute(f"SELECT {', '.join(_quote(column) for column in columns)} FROM read_parquet(?)", [str(path)]).fetchdf()
+        for column, dtype in (dtypes or {}).items():
+            frame[column] = frame[column].astype(dtype)
+        return frame
     finally:
         con.close()
 

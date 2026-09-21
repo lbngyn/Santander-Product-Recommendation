@@ -109,9 +109,10 @@ DuckDB allocation speeds disk-backed panel/sample queries, but leaves little
 headroom on a standard 12 GB Colab runtime; lower `runtime.memory_limit` if the
 runtime also has other large in-memory workloads.
 
-The configured `device_type: cuda` requires a CUDA-enabled LightGBM package;
-the standard pip wheel is not sufficient. After selecting a GPU runtime in
-Colab and after the regular bootstrap, run:
+The baseline is configured with `device_type: cpu`. For a later GPU optimisation
+experiment, a CUDA-enabled LightGBM package is required; the standard pip wheel
+is not sufficient. After selecting a GPU runtime in Colab and after the regular
+bootstrap, run:
 
 ```bash
 bash scripts/install_lightgbm_cuda_colab.sh

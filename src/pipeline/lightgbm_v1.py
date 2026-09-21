@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 import yaml
+import pandas as pd
 
 from src.features.model_panel import build_model_panel
 from src.inference.predict import load_artifact_metadata
@@ -53,6 +54,7 @@ def run_lightgbm_v1(config: Mapping[str, Any], *, resolved_config_path: str | Pa
         models = train_product_classifiers(
             panel_path, artifacts / "models", model_version=str(model["version"]),
             max_rows_per_product=model.get("max_rows_per_product"),
+            max_negative_rows_per_product=model.get("max_negative_rows_per_product"),
             random_state=int(model.get("random_state", 42)),
             n_estimators=int(model.get("n_estimators", 300)), n_jobs=int(runtime.get("threads", 1)),
             memory_limit=runtime.get("memory_limit"), temp_directory=runtime.get("temp_directory"),
@@ -115,6 +117,12 @@ def run_lightgbm_v1_competition_from_config(
         raise ValueError("A model artifact does not match its product index key.")
     product_names = list(artifact_directories)
     feature_names = sorted({name for artifact in metadata.values() for name in artifact.schema.feature_names})
+    expected_dtypes: dict[str, str] = {}
+    for artifact in metadata.values():
+        for name, dtype in artifact.schema.dtypes.items():
+            if name in expected_dtypes and expected_dtypes[name] != dtype:
+                raise ValueError(f"Conflicting artifact dtypes for {name!r}: {expected_dtypes[name]!r}, {dtype!r}")
+            expected_dtypes[name] = dtype
     runtime = config.get("runtime", {})
     test_checkpoint = root / competition["interim_test"]
     build_interim_checkpoint(
@@ -130,9 +138,23 @@ def run_lightgbm_v1_competition_from_config(
         temp_directory=runtime.get("temp_directory"),
     )
     required_columns = ["ncodpers", *sorted({"prev_" + product for product in product_names}), *feature_names]
-    prepared_frame = load_competition_input(prepared, columns=list(dict.fromkeys(required_columns)))
+    prepared_frame = load_competition_input(
+        prepared, columns=list(dict.fromkeys(required_columns)), dtypes=expected_dtypes,
+    )
+    sample_submission = root / competition["sample_submission"]
+    if not sample_submission.is_file():
+        if not bool(competition.get("generate_template_if_missing", False)):
+            raise FileNotFoundError(
+                f"sample_submission.csv is missing: {sample_submission}. "
+                "Upload the official template or set competition.generate_template_if_missing=true "
+                "to create a schema-compatible template from test_ver2 row order."
+            )
+        sample_submission = run_directory / "generated_sample_submission.csv"
+        pd.DataFrame(
+            {"ncodpers": prepared_frame["ncodpers"].to_numpy(), "added_products": ""}
+        ).to_csv(sample_submission, index=False)
     submission = run_competition_test_inference(
-        prepared_frame, root / competition["sample_submission"], artifact_directories,
+        prepared_frame, sample_submission, artifact_directories,
         run_directory / "submission.csv", top_k=int(competition.get("top_k", 7)),
     )
     (run_directory / "submission_manifest.json").write_text(
@@ -141,7 +163,7 @@ def run_lightgbm_v1_competition_from_config(
                 "model_index": str(index),
                 "run_config": str(resolved_config),
                 "prepared_input": str(prepared),
-                "sample_submission": str(root / competition["sample_submission"]),
+                "sample_submission": str(sample_submission),
                 "submission": str(submission),
                 "history_date": str(competition["history_date"]),
             },

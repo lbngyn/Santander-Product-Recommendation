@@ -16,6 +16,10 @@ competition:
   interim_test: interim/test.parquet
   prepared_input: processed/lightgbm_v1/competition_test_input.parquet
   sample_submission: raw/sample_submission.csv
+  # The official template is preferred. The current Drive input contains only
+  # test_ver2.csv, so create an equivalent ncodpers-ordered template when it
+  # is absent; the generated copy is persisted beside the run artifacts.
+  generate_template_if_missing: true
   history_date: 2016-05-28
   chunksize: 50000
   force_rebuild: false
@@ -32,18 +36,19 @@ model:
   random_state: 42
   # Print LightGBM's training metrics after every five trees (0 disables it).
   training_log_period: 5
-  # Requires a CUDA-enabled LightGBM build in the Colab runtime.
+  # CPU baseline; enable CUDA only in a later optimisation experiment.
   lightgbm_params:
-    device_type: cuda
-    gpu_device_id: 0
-    max_bin: 63
+    device_type: cpu
   # Set a bound for constrained experiments; null uses every eligible row.
   max_rows_per_product: null
+  # Keep every acquisition and cap only the overwhelming non-acquisition class.
+  # This is the Colab setting that completed without exhausting RAM.
+  max_negative_rows_per_product: 500000
 
 runtime:
-  # Colab runtime: allow DuckDB to retain larger intermediates and use CPU parallelism.
-  memory_limit: 10GB
-  threads: 4
+  # Verified Colab CPU setting: enough for DuckDB, without exhausting RAM.
+  memory_limit: 4GB
+  threads: 2
   temp_directory: data/.duckdb_tmp
 
 tracking:
