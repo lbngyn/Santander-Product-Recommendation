@@ -24,7 +24,7 @@ competition:
 features:
   # Rebuild once so the persisted panel replaces legacy hashed categoricals
   # with semantic category values. Set false again after this clean run.
-  force_process: true
+  force_process: false
 
 model:
   version: lightgbm-binary-v2-history-persona
