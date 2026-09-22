@@ -31,8 +31,14 @@ model:
   training_log_period: 5
   lightgbm_params:
     device_type: cpu
+    # Col-wise uses less Dataset memory than the auto-selected row-wise mode.
+    # Keep the histogram cache bounded while each product consumes all of its
+    # eligible adjacent-month customer rows.
+    force_col_wise: true
+    histogram_pool_size: 512
   max_rows_per_product: null
-  max_negative_rows_per_product: 500000
+  # null means retain every eligible negative and every acquisition event.
+  max_negative_rows_per_product: null
 
 runtime:
   memory_limit: 4GB

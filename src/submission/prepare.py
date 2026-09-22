@@ -7,7 +7,11 @@ from typing import Sequence
 import duckdb
 
 from src.features.customer_history import HISTORY_FEATURE_NAMES, product_event_count_sql
-from src.features.persona import PERSONA_FEATURES, persona_projection_sql
+from src.features.persona import (
+    PERSONA_FEATURES,
+    persona_feature_projection_sql,
+    raw_persona_projection_sql,
+)
 
 
 def materialize_competition_test_input(
@@ -47,14 +51,15 @@ def materialize_competition_test_input(
             raise ValueError(f"Input schema missing: test={sorted(missing_test)}, history={sorted(missing_history)}")
         history_features = set(HISTORY_FEATURE_NAMES)
         profile_features = [name for name in feature_names if not name.startswith("prev_") and name not in history_features]
-        missing_features = set(profile_features).difference(test_columns)
-        if missing_features:
-            raise ValueError(f"Test checkpoint lacks model feature(s): {sorted(missing_features)}")
+        unknown_features = set(profile_features).difference(PERSONA_FEATURES)
+        if unknown_features:
+            raise ValueError(f"Unknown canonical persona model feature(s): {sorted(unknown_features)}")
         if not bool(con.execute("SELECT count(*) = count(DISTINCT ncodpers) FROM read_parquet(?)", [str(test)]).fetchone()[0]):
             raise ValueError("Competition test must contain one row per ncodpers.")
         q = _quote
-        requested_persona = [name for name in profile_features if name in PERSONA_FEATURES]
-        persona_sql = persona_projection_sql("test", test_columns, features=requested_persona)
+        persona_sql = persona_feature_projection_sql(features=profile_features)
+        test_raw_persona_sql = raw_persona_projection_sql("test", test_columns)
+        history_raw_persona_sql = raw_persona_projection_sql("history", history_columns)
         profiles = ", ".join(f"test.{q(name)}" for name in profile_features)
         previous = ", ".join(
             f"CAST(COALESCE(history.{q(product)}, 0) AS TINYINT) AS {q('prev_' + product)}"
@@ -76,9 +81,21 @@ def materialize_competition_test_input(
         con.execute(
             f"""
             COPY (
-                WITH test_rows AS (
-                    SELECT test.ncodpers, test.fecha_dato{', ' if persona_sql else ''}{persona_sql}
+                WITH profile_history AS (
+                    SELECT history.ncodpers, history.fecha_dato, 0 AS source_rank, {history_raw_persona_sql}
+                    FROM read_parquet('{history_sql}') AS history
+                    WHERE CAST(history.fecha_dato AS DATE) <= CAST('{history_date_sql}' AS DATE)
+                ), profile_test AS (
+                    SELECT test.ncodpers, test.fecha_dato, 1 AS source_rank, {test_raw_persona_sql}
                     FROM read_parquet('{test_sql}') AS test
+                ), profile_ordered AS (
+                    SELECT *, {persona_sql}
+                    FROM (SELECT * FROM profile_history UNION ALL BY NAME SELECT * FROM profile_test)
+                    WINDOW customer_time AS (PARTITION BY ncodpers ORDER BY fecha_dato, source_rank),
+                           prior_customer_rows AS (PARTITION BY ncodpers ORDER BY fecha_dato, source_rank ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)
+                ), test_rows AS (
+                    SELECT ncodpers, fecha_dato{', ' if profiles else ''}{profiles}
+                    FROM profile_ordered AS test WHERE source_rank = 1
                 ), history_base AS (
                     SELECT * FROM read_parquet('{history_sql}')
                     WHERE CAST(fecha_dato AS DATE) <= CAST('{history_date_sql}' AS DATE)

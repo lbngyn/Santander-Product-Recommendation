@@ -8,7 +8,7 @@ import duckdb
 
 from src.features.customer_history import acquisition_label_sql, product_event_count_sql, quote
 from src.features.history_features import customer_history_length_window_sql, record_gap_months_sql
-from src.features.persona import PERSONA_FEATURES, persona_projection_sql
+from src.features.persona import PERSONA_FEATURES, persona_feature_projection_sql, raw_persona_projection_sql
 
 
 def build_model_panel(source_path: str | Path, destination_path: str | Path, *, history_feature_sql: Sequence[str], force_process: bool = False, memory_limit: str | None = None, temp_directory: str | Path | None = None) -> Path:
@@ -41,7 +41,8 @@ def build_model_panel(source_path: str | Path, destination_path: str | Path, *, 
         if not products:
             raise ValueError("Source has no product columns ending in '_ult1'.")
         profile_sql = ", ".join(quote(column) for column in PERSONA_FEATURES)
-        persona_sql = persona_projection_sql("source", columns)
+        raw_persona_sql = raw_persona_projection_sql("source", columns)
+        persona_sql = persona_feature_projection_sql()
         product_sql = ", ".join(f"source.{quote(product)}" for product in products)
         previous_states = ", ".join(f"CAST(COALESCE({quote('previous_' + product)}, 0) AS TINYINT) AS {quote('prev_' + product)}" for product in products)
         previous_raw = ", ".join(f"LAG({quote(product)}) OVER customer_time AS {quote('previous_' + product)}" for product in products)
@@ -57,14 +58,15 @@ def build_model_panel(source_path: str | Path, destination_path: str | Path, *, 
         con.execute(f"""
             COPY (
                 WITH source_rows AS (
-                    SELECT source.ncodpers, source.fecha_dato, {persona_sql}, {product_sql}
+                    SELECT source.ncodpers, source.fecha_dato, {raw_persona_sql}, {product_sql}
                     FROM read_parquet('{source_sql}') AS source
                 ), ordered AS (
-                    SELECT *, LAG(fecha_dato) OVER customer_time AS previous_date,
+                    SELECT *, {persona_sql}, LAG(fecha_dato) OVER customer_time AS previous_date,
                            {customer_history_length_window_sql()},
                            {previous_raw}
                     FROM source_rows
-                    WINDOW customer_time AS (PARTITION BY ncodpers ORDER BY fecha_dato)
+                    WINDOW customer_time AS (PARTITION BY ncodpers ORDER BY fecha_dato),
+                           prior_customer_rows AS (PARTITION BY ncodpers ORDER BY fecha_dato ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)
                 ), transitions AS (
                     SELECT *, {record_gap_months_sql()}
                     FROM ordered

@@ -1,21 +1,31 @@
-"""Stable model representations for Santander's 20 persona fields."""
+"""Leakage-safe canonical persona features.
+
+Raw Santander profile names are deliberately confined to this module.  All
+model-facing code consumes the names in :data:`PERSONA_FEATURES` instead.
+"""
 from __future__ import annotations
 
 from collections.abc import Sequence
 
 
-# The two raw date fields are deliberately excluded: they need a separately
-# versioned lifecycle representation, rather than being passed as timestamps.
+RAW_PERSONA_COLUMNS: tuple[str, ...] = (
+    "fecha_alta", "age", "renta", "ind_nuevo", "indrel", "indrel_1mes",
+    "tiprel_1mes", "ult_fec_cli_1t", "ind_actividad_cliente", "ind_empleado",
+    "sexo", "indfall", "pais_residencia", "cod_prov", "indresi",
+    "canal_entrada", "segmento", "antiguedad", "tipodom", "indext",
+)
+
+# These are the only persona columns emitted into a model panel.
 PERSONA_FEATURES: tuple[str, ...] = (
-    "ind_empleado", "pais_residencia", "sexo", "age", "ind_nuevo",
-    "antiguedad", "indrel", "indrel_1mes", "tiprel_1mes", "indresi",
-    "indext", "conyuemp", "canal_entrada", "indfall", "tipodom",
-    "cod_prov", "nomprov", "ind_actividad_cliente", "renta", "segmento",
+    "time_idx", "snapshot_month", "account_age_months", "age", "income_log",
+    "is_new_customer", "customer_relationship_status", "is_active_customer",
+    "employee_status", "is_male", "is_deceased", "country", "province",
+    "is_domestic", "entry_channel", "customer_segment",
+    "profile_missing_structural",
 )
 CATEGORICAL_PERSONA_FEATURES: tuple[str, ...] = (
-    "ind_empleado", "pais_residencia", "sexo", "indrel_1mes",
-    "tiprel_1mes", "indresi", "indext", "conyuemp", "canal_entrada",
-    "indfall", "nomprov", "segmento",
+    "snapshot_month", "customer_relationship_status", "employee_status", "country",
+    "province", "entry_channel", "customer_segment",
 )
 
 
@@ -23,33 +33,75 @@ def quote(identifier: str) -> str:
     return '"' + identifier.replace('"', '""') + '"'
 
 
-def persona_projection_sql(
-    source_alias: str,
-    available_columns: Sequence[str],
-    *,
-    features: Sequence[str] = PERSONA_FEATURES,
-) -> str:
-    """Project every required persona field into stable numeric model inputs.
+def raw_persona_projection_sql(source_alias: str, available_columns: Sequence[str]) -> str:
+    """Select raw profile values under an internal ``raw_`` prefix.
 
-    Categorical values use a deterministic non-negative 31-bit hash. This
-    avoids a train/test-fitted mapping while LightGBM receives their column
-    names separately as categorical features; numeric persona fields preserve
-    their original values.
+    Missing legacy fields are NULL so feature-subset artifacts remain usable.
+    """
+    available = set(available_columns)
+    expressions = []
+    for name in RAW_PERSONA_COLUMNS:
+        target = quote("raw_" + name)
+        expressions.append(
+            f"{source_alias}.{quote(name)} AS {target}" if name in available else f"NULL AS {target}"
+        )
+    return ", ".join(expressions)
+
+
+def persona_feature_projection_sql(*, features: Sequence[str] = PERSONA_FEATURES) -> str:
+    """Return canonical persona SQL in a ``customer_time`` window.
+
+    Stable values use previous observations only; dynamic states are never
+    forward-filled.  This makes the representation safe for temporal splits.
     """
     unknown = set(features).difference(PERSONA_FEATURES)
     if unknown:
-        raise ValueError(f"Unknown persona feature(s): {sorted(unknown)}")
-    missing = set(features).difference(available_columns)
-    if missing:
-        raise ValueError(f"Persona source lacks required fields: {sorted(missing)}")
+        raise ValueError(f"Unknown canonical persona feature(s): {sorted(unknown)}")
+
+    def raw(name: str) -> str:
+        return quote("raw_" + name)
+
+    def text(name: str) -> str:
+        return f"NULLIF(TRIM(CAST({raw(name)} AS VARCHAR)), '')"
+
+    def stable(value: str) -> str:
+        return f"COALESCE({value}, LAST_VALUE({value} IGNORE NULLS) OVER prior_customer_rows)"
+
+    age = f"TRY_CAST({raw('age')} AS DOUBLE)"
+    income = f"CASE WHEN TRY_CAST({raw('renta')} AS DOUBLE) >= 0 THEN TRY_CAST({raw('renta')} AS DOUBLE) END"
+    opening_date = f"TRY_CAST({raw('fecha_alta')} AS DATE)"
+    relationship = (
+        f"COALESCE(REPLACE({text('indrel_1mes')}, '.0', ''), {text('tiprel_1mes')}, "
+        f"REPLACE({text('indrel')}, '.0', ''), CASE WHEN {raw('ult_fec_cli_1t')} IS NOT NULL THEN '99' END)"
+    )
+    structural = ("age", "antiguedad", "ind_nuevo", "indrel", "ind_actividad_cliente",
+                  "ind_empleado", "indfall", "pais_residencia", "fecha_alta", "tipodom", "indresi", "indext")
+    values: dict[str, str] = {
+        "time_idx": "CAST(date_diff('month', MIN(CAST(fecha_dato AS DATE)) OVER (), CAST(fecha_dato AS DATE)) AS INTEGER)",
+        "snapshot_month": "CAST(EXTRACT(MONTH FROM CAST(fecha_dato AS DATE)) AS INTEGER)",
+        "account_age_months": f"CAST(date_diff('month', {stable(opening_date)}, CAST(fecha_dato AS DATE)) AS INTEGER)",
+        "age": f"CAST({stable(age)} AS DOUBLE)",
+        "income_log": f"LN(1 + {stable(income)})",
+        "is_new_customer": f"CAST(CASE {text('ind_nuevo')} WHEN '1' THEN 1 WHEN '0' THEN 0 END AS TINYINT)",
+        "customer_relationship_status": relationship,
+        "is_active_customer": f"CAST(CASE {text('ind_actividad_cliente')} WHEN '1' THEN 1 WHEN '0' THEN 0 END AS TINYINT)",
+        "employee_status": stable(text("ind_empleado")),
+        "is_male": f"CAST(CASE {stable(text('sexo'))} WHEN 'H' THEN 1 WHEN 'V' THEN 0 END AS TINYINT)",
+        "is_deceased": f"CAST(CASE {stable(text('indfall'))} WHEN 'S' THEN 1 WHEN 'N' THEN 0 END AS TINYINT)",
+        "country": stable(text("pais_residencia")),
+        "province": stable(text("cod_prov")),
+        "is_domestic": f"CAST(CASE {stable(text('indresi'))} WHEN 'S' THEN 1 WHEN 'N' THEN 0 END AS TINYINT)",
+        "entry_channel": stable(text("canal_entrada")),
+        "customer_segment": text("segmento"),
+        "profile_missing_structural": "CAST((" + " AND ".join(f"{raw(name)} IS NULL" for name in structural) + ") AS TINYINT)",
+    }
     categorical = set(CATEGORICAL_PERSONA_FEATURES)
-    expressions = []
-    for feature in features:
-        column = f"{source_alias}.{quote(feature)}"
-        if feature in categorical:
-            expressions.append(
-                f"CAST(hash(COALESCE(CAST({column} AS VARCHAR), '__MISSING__')) % 2147483647 AS INTEGER) AS {quote(feature)}"
-            )
-        else:
-            expressions.append(f"{column} AS {quote(feature)}")
-    return ", ".join(expressions)
+    projections = []
+    for name in features:
+        value = values[name]
+        # snapshot_month already is the documented [1, 12] categorical code;
+        # preserve it instead of replacing its interpretable value with a hash.
+        if name in categorical and name != "snapshot_month":
+            value = f"CAST(hash(COALESCE(CAST({value} AS VARCHAR), '__MISSING__')) % 2147483647 AS INTEGER)"
+        projections.append(f"{value} AS {quote(name)}")
+    return ", ".join(projections)

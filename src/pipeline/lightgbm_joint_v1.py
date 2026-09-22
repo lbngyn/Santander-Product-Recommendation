@@ -11,6 +11,7 @@ import pandas as pd
 import yaml
 
 from src.features.model_panel import build_model_panel
+from src.features.persona import CATEGORICAL_PERSONA_FEATURES, PERSONA_FEATURES
 from src.inference.predict import load_artifact
 from src.ingestion.checkpoint import build_interim_checkpoint
 from src.models.lightgbm_joint import (
@@ -27,20 +28,6 @@ from src.submission.prepare import load_competition_input, materialize_competiti
 from src.tracking.run_context import build_run_manifest, create_run_id, write_run_manifest
 
 
-# All non-temporal customer/persona columns in the existing model panel.
-# The two raw dates are excluded: unlike the 20 static/persona fields below,
-# they have no existing numeric/categorical model representation.
-PERSONA_FEATURES = (
-    "ind_empleado", "pais_residencia", "sexo", "age", "ind_nuevo",
-    "antiguedad", "indrel", "indrel_1mes", "tiprel_1mes", "indresi",
-    "indext", "conyuemp", "canal_entrada", "indfall", "tipodom",
-    "cod_prov", "nomprov", "ind_actividad_cliente", "renta", "segmento",
-)
-CATEGORICAL_PERSONA_FEATURES = (
-    "ind_empleado", "pais_residencia", "sexo", "indrel_1mes",
-    "tiprel_1mes", "indresi", "indext", "conyuemp", "canal_entrada",
-    "indfall", "nomprov", "segmento",
-)
 
 
 def run_lightgbm_joint_v1_from_config(
@@ -186,7 +173,7 @@ def _numeric_feature_names(panel_path: Path) -> list[str]:
 
 
 def _joint_feature_names(panel_path: Path) -> list[str]:
-    """Return 20 customer/persona fields plus all 24 prior-product states."""
+    """Return canonical persona fields plus all 24 prior-product states."""
     con = duckdb.connect(database=":memory:")
     try:
         columns = {row[0] for row in con.execute("DESCRIBE SELECT * FROM read_parquet(?)", [str(panel_path)]).fetchall()}
