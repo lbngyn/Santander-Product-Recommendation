@@ -1,0 +1,18 @@
+stages:
+  baseline_v0:
+    cmd: python scripts/run_baseline_v0.py --config configs/baselines/v0.yaml
+    deps:
+      - configs/baselines/v0.yaml
+      - scripts/run_baseline_v0.py
+      - src/pipeline/baseline_v0.py
+      - src/models/popularity.py
+      - src/data/gcs_storage.py
+      - src/ingestion/checkpoint.py
+      - src/preprocessing/customer_profile.py
+      - src/tracking/run_context.py
+    params:
+      - configs/baselines/v0.yaml
+    outs:
+      - data/interim/baseline_v0
+      - data/processed/baseline_v0
+      - artifacts/runs

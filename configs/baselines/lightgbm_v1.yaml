@@ -1,0 +1,64 @@
+pipeline:
+  version: lightgbm-acquisition-v1
+  description: >-
+    24 independent LightGBM binary acquisition classifiers. Customer profile
+    values use month t; product ownership inputs use only t-1.
+
+data:
+  # Relative to SANTANDER_DATA_ROOT.
+  interim_train: interim/train.parquet
+  model_panel: processed/lightgbm_v1/model_panel.parquet
+  artifact_dir: artifacts
+
+competition:
+  # Paths are relative to SANTANDER_DATA_ROOT.
+  raw_test: raw/test_ver2.csv
+  interim_test: interim/test.parquet
+  prepared_input: processed/lightgbm_v1/competition_test_input.parquet
+  sample_submission: raw/sample_submission.csv
+  # The official template is preferred. The current Drive input contains only
+  # test_ver2.csv, so create an equivalent ncodpers-ordered template when it
+  # is absent; the generated copy is persisted beside the run artifacts.
+  generate_template_if_missing: true
+  history_date: 2016-05-28
+  chunksize: 50000
+  force_rebuild: false
+  show_progress: true
+  top_k: 7
+
+features:
+  force_process: false
+
+model:
+  version: lightgbm-binary-v1
+  # Fast smoke-run setting: 24 independent models, 20 trees each.
+  n_estimators: 20
+  random_state: 42
+  # Print LightGBM's training metrics after every five trees (0 disables it).
+  training_log_period: 5
+  # CPU baseline; enable CUDA only in a later optimisation experiment.
+  lightgbm_params:
+    device_type: cpu
+  # Set a bound for constrained experiments; null uses every eligible row.
+  max_rows_per_product: null
+  # Keep every acquisition and cap only the overwhelming non-acquisition class.
+  # This is the Colab setting that completed without exhausting RAM.
+  max_negative_rows_per_product: 500000
+
+runtime:
+  # Verified Colab CPU setting: enough for DuckDB, without exhausting RAM.
+  memory_limit: 4GB
+  threads: 2
+  temp_directory: data/.duckdb_tmp
+
+tracking:
+  mlflow:
+    enabled: true
+    tracking_uri: sqlite:///mlruns.db
+    experiment_name: santander-lightgbm-acquisition
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: .hydra/runs/${now:%Y-%m-%d}/${now:%H-%M-%S}

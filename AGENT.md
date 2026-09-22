@@ -84,3 +84,12 @@ Whenever a memory optimization is introduced, update the README with:
 8. **Debug systematically:** find root cause before changing implementation.
 9. **Experiment to decide:** compare alternatives with measurable criteria.
 10. **Keep user control:** explain assumptions and significant changes.
+
+## Clarification & Decision-Making Rule
+
+- If an instruction, requirement, constraint, expected behavior, or business/modeling logic is ambiguous, incomplete, or insufficiently specified, **ask the user for clarification before proceeding**.
+- **Do not guess or silently fill in missing requirements.**
+- **Do not independently choose or change technologies, frameworks, libraries, architectures, modeling approaches, or infrastructure** unless the user explicitly asks for a recommendation or authorizes that decision.
+- **Do not independently define, modify, or assume business logic, data logic, feature logic, target definitions, temporal rules, preprocessing rules, or evaluation logic** that has not been explicitly approved by the user.
+- When multiple reasonable approaches exist and the choice could materially affect the implementation or result, briefly explain the relevant options/trade-offs and **ask the user to choose or approve one before implementation**.
+- You may make minor implementation decisions that do not alter the approved requirements, logic, technology choices, or expected behavior.

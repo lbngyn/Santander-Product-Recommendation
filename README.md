@@ -86,6 +86,43 @@ Không commit file config, service-account JSON, GitHub PAT, Base64 bundle, ho�
 
 Skeleton để tổ chức side project Santander Product Recommendation. Repository hiện chỉ chứa cấu trúc thư mục — chưa có pipeline, model, dependency hay notebook implementation.
 
+## LightGBM v1 competition submission
+
+After completing a LightGBM v1 training run, create its submission with:
+
+```powershell
+python scripts/run_lightgbm_v1_submission.py data/artifacts/runs/<run_id>/model_artifacts.json
+```
+
+The command streams `raw/test_ver2.csv` into `interim/test.parquet`, joins each
+test customer to product ownership from `interim/train.parquet` at `2016-05-28`,
+and invokes the schema-validated generic `predict()` interface for every model.
+It writes the final CSV to:
+
+```text
+<SANTANDER_DATA_ROOT>/artifacts/runs/<run_id>/submission.csv
+```
+
+For the initial Colab smoke run, each of the 24 LightGBM models uses 20 trees,
+DuckDB has a 10 GB memory limit, and LightGBM uses four CPU threads. The larger
+DuckDB allocation speeds disk-backed panel/sample queries, but leaves little
+headroom on a standard 12 GB Colab runtime; lower `runtime.memory_limit` if the
+runtime also has other large in-memory workloads.
+
+The baseline is configured with `device_type: cpu`. For a later GPU optimisation
+experiment, a CUDA-enabled LightGBM package is required; the standard pip wheel
+is not sufficient. After selecting a GPU runtime in Colab and after the regular
+bootstrap, run:
+
+```bash
+bash scripts/install_lightgbm_cuda_colab.sh
+```
+
+Then run the non-bootstrap training cells. If LightGBM was already imported in
+the current kernel, restart the runtime, run bootstrap once, and then run the
+installer before importing the training pipeline. The installer follows
+LightGBM's documented source build with `USE_CUDA=ON`.
+
 ## Cấu trúc
 
 ```text

@@ -229,3 +229,7 @@ artifacts/*
 mlruns/
 secrets/
 .codex/
+.hydra/
+data/
+
+*.db

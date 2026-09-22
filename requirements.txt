@@ -5,3 +5,8 @@ matplotlib
 google-cloud-storage
 python-dotenv
 tqdm
+PyYAML
+hydra-core
+mlflow
+dvc
+lightgbm

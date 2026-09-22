@@ -1,0 +1,60 @@
+pipeline:
+  version: lightgbm-joint-v1
+  description: One shared LightGBM classifier over unowned product candidates.
+
+data:
+  interim_train: interim/train.parquet
+  model_panel: processed/lightgbm_joint_v1/model_panel.parquet
+  artifact_dir: artifacts
+
+split:
+  # Same temporal holdout convention used by the existing baseline pipeline.
+  validation_date: 2016-05-28
+
+competition:
+  raw_test: raw/test_ver2.csv
+  interim_test: interim/test.parquet
+  prepared_input: processed/lightgbm_joint_v1/competition_test_input.parquet
+  sample_submission: raw/sample_submission.csv
+  generate_template_if_missing: true
+  history_date: 2016-05-28
+  chunksize: 50000
+  force_rebuild: false
+  show_progress: true
+  top_k: 7
+  batch_customers: 50000
+
+features:
+  force_process: false
+
+model:
+  version: lightgbm-joint-v1
+  n_estimators: 500
+  random_state: 42
+  lightgbm_params:
+    device_type: cpu
+
+native_training:
+  # Benchmark these compact customer-month sizes before a full native Dataset
+  # attempt. Each size is expanded sequentially in bounded record batches.
+  batch_customer_months: 25000
+  benchmark_compact_row_limits: [100000, 250000, 500000, 1000000]
+
+xgboost_external:
+  version: xgboost-joint-external-v1
+  n_estimators: 100
+  generate_submission: true
+  benchmark_compact_row_limits: [5000000]
+  expand_batch_customer_months: 25000
+  xgboost_batch_rows: 250000
+  params:
+    max_bin: 256
+
+runtime:
+  memory_limit: 4GB
+  threads: 2
+  temp_directory: data/.duckdb_tmp
+
+hydra:
+  job:
+    chdir: false
