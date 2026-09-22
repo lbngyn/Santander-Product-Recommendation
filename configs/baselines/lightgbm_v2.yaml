@@ -37,8 +37,12 @@ model:
     force_col_wise: true
     histogram_pool_size: 512
   max_rows_per_product: null
-  # null means retain every eligible negative and every acquisition event.
-  max_negative_rows_per_product: null
+  # Keep all acquisition events; cap only eligible negatives per product.
+  # This is the active cap in Colab; for products below 500k acquisitions it
+  # is equivalent to min(500k, 1M - positive_samples).
+  max_negative_rows_per_product: 500000
+  # Hard upper bound for positives plus negatives in each product model.
+  max_total_rows_per_product: 1000000
 
 runtime:
   memory_limit: 4GB

@@ -62,6 +62,7 @@ def run_lightgbm_v1(
             panel_path, artifacts / "models", model_version=str(model["version"]),
             max_rows_per_product=model.get("max_rows_per_product"),
             max_negative_rows_per_product=model.get("max_negative_rows_per_product"),
+            max_total_rows_per_product=model.get("max_total_rows_per_product"),
             random_state=int(model.get("random_state", 42)),
             n_estimators=int(model.get("n_estimators", 300)), n_jobs=int(runtime.get("threads", 1)),
             memory_limit=runtime.get("memory_limit"), temp_directory=runtime.get("temp_directory"),
