@@ -5,6 +5,7 @@ import gc
 import pickle
 import json
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -24,6 +25,7 @@ def train_product_classifiers(
     *,
     feature_names: Sequence[str] | None = None,
     model_version: str = "lightgbm-binary-v1",
+    product_names: Sequence[str] | None = None,
     max_rows_per_product: int | None = None,
     max_negative_rows_per_product: int | None = None,
     max_total_rows_per_product: int | None = None,
@@ -61,10 +63,17 @@ def train_product_classifiers(
             escaped_tmp = str(tmp).replace("'", "''")
             con.execute(f"SET temp_directory = '{escaped_tmp}'")
         columns = [r[0] for r in con.execute("DESCRIBE SELECT * FROM read_parquet(?)", [str(source)]).fetchall()]
-        products = [c.removeprefix("acq_") for c in columns if c.startswith("acq_")]
-        if len(products) != 24:
-            raise ValueError(f"Expected 24 acquisition labels, found {len(products)}.")
-        default_features = [c for c in columns if c not in { *MODEL_METADATA_COLUMNS, *["acq_" + p for p in products]}]
+        all_products = [c.removeprefix("acq_") for c in columns if c.startswith("acq_")]
+        if len(all_products) != 24:
+            raise ValueError(f"Expected 24 acquisition labels, found {len(all_products)}.")
+        requested_products = set(product_names or all_products)
+        unknown_products = requested_products.difference(all_products)
+        if unknown_products:
+            raise ValueError(f"Requested product(s) are absent from the model panel: {sorted(unknown_products)}")
+        products = [product for product in all_products if product in requested_products]
+        if not products:
+            raise ValueError("At least one product must be selected for training.")
+        default_features = [c for c in columns if c not in { *MODEL_METADATA_COLUMNS, *["acq_" + p for p in all_products]}]
         selected = list(feature_names or default_features)
         forbidden = set(selected).intersection(MODEL_METADATA_COLUMNS)
         if forbidden:
@@ -89,7 +98,11 @@ def train_product_classifiers(
             # Materialise exactly the types LightGBM needs.  DuckDB otherwise
             # returns most numerics as float64 / int64, doubling DataFrame RAM.
             projection = ", ".join(
-                f"CAST({_quote(name)} AS INTEGER) AS {_quote(name)}"
+                # Preserve semantic category values in the panel.  Pandas
+                # creates compact, unordered category codes only at the
+                # LightGBM boundary; no one-hot, hash, or manual label
+                # encoding is used.
+                f"CAST({_quote(name)} AS VARCHAR) AS {_quote(name)}"
                 if name in categorical
                 else f"CAST({_quote(name)} AS FLOAT) AS {_quote(name)}"
                 for name in selected
@@ -134,18 +147,25 @@ def train_product_classifiers(
             rss_before_load = _rss_bytes()
             frame = con.execute(query, parameters).fetchdf()
             rss_after_load = _rss_bytes()
-            # The baseline deliberately uses numeric prepared features.  A
-            # categorical pipeline may pass its encoded feature_names instead;
-            # retaining raw object columns here would make the model artifact
-            # non-reproducible at inference time.
+            for name in categorical:
+                # ``MISSING`` is a meaningful persona state.  ``category``
+                # gives LightGBM compact internal IDs and native categorical
+                # splits while retaining the values' unordered semantics.
+                frame[name] = frame[name].fillna("MISSING").astype("category")
             if feature_names is None and not result:
-                selected = [c for c in selected if pd.api.types.is_numeric_dtype(frame[c])]
+                selected = [
+                    c for c in selected
+                    if c in categorical or pd.api.types.is_numeric_dtype(frame[c])
+                ]
                 if not selected:
-                    raise ValueError("No numeric model features found; provide encoded feature_names.")
+                    raise ValueError("No numeric or categorical model features found.")
                 frame = frame[[*selected, "acq_" + product]]
-            non_numeric = [c for c in selected if not pd.api.types.is_numeric_dtype(frame[c])]
+            non_numeric = [
+                c for c in selected
+                if c not in categorical and not pd.api.types.is_numeric_dtype(frame[c])
+            ]
             if non_numeric:
-                raise TypeError(f"Features must be numeric/encoded for LightGBM baseline: {non_numeric}")
+                raise TypeError(f"Features must be numeric or Pandas categorical for LightGBM: {non_numeric}")
             if frame.empty or frame[label_name].nunique() < 2:
                 raise ValueError(f"Product {product} has insufficient eligible examples from both classes.")
             # ``frame`` now contains only selected input columns, so popping
@@ -163,23 +183,31 @@ def train_product_classifiers(
                 objective="binary", n_estimators=n_estimators, random_state=random_state,
                 n_jobs=n_jobs, **dict(lightgbm_params or {}),
             )
-            callbacks = [lgb.log_evaluation(period=training_log_period)] if training_log_period else []
-            model_started = time.perf_counter()
-            classifier.fit(
-                X, y,
-                eval_set=[(X, y)], eval_names=["training"],
-                eval_metric=["binary_logloss", "auc"], callbacks=callbacks,
-                categorical_feature=categorical,
-            )
-            duration_seconds = time.perf_counter() - model_started
-            rss_after_fit = _rss_bytes()
             directory = root / product
             directory.mkdir(parents=True, exist_ok=True)
+            monitor = _MemoryMonitor(directory / "memory_samples.jsonl")
+            model_started = time.perf_counter()
+            monitor.start()
+            try:
+                # Evaluating against X/y during fit is not validation and can
+                # construct another full LightGBM Dataset.  Omit it to reduce
+                # the peak allocation; real temporal validation happens in
+                # the pipeline after training.
+                classifier.fit(X, y, categorical_feature=categorical)
+            finally:
+                monitor.stop()
+            duration_seconds = time.perf_counter() - model_started
+            rss_after_fit = _rss_bytes()
             with (directory / "model.pkl").open("wb") as handle:
                 pickle.dump(classifier, handle)
-            schema = InputSchema(feature_names=selected, dtypes={c: str(X[c].dtype) for c in selected}, version="1")
+            schema = InputSchema(
+                feature_names=selected,
+                dtypes={c: str(X[c].dtype) for c in selected},
+                category_values={c: X[c].cat.categories.tolist() for c in categorical},
+                version="1",
+            )
             write_artifact_metadata(directory, ModelArtifact(product=product, model_version=model_version, schema=schema))
-            metrics = {name: float(values[-1]) for name, values in classifier.evals_result_["training"].items()}
+            metrics: dict[str, float | int | None] = {}
             metrics.update({
                 "eligible_rows": len(y),
                 "acquisitions": positives,
@@ -187,6 +215,8 @@ def train_product_classifiers(
                 "rss_before_load_bytes": rss_before_load,
                 "rss_after_load_bytes": rss_after_load,
                 "rss_after_fit_bytes": rss_after_fit,
+                "rss_peak_during_fit_bytes": monitor.peak_rss_bytes,
+                "mem_available_min_during_fit_bytes": monitor.min_mem_available_bytes,
             })
             elapsed_seconds = time.perf_counter() - training_started
             average_seconds = elapsed_seconds / model_number
@@ -202,7 +232,7 @@ def train_product_classifiers(
             # free C++ Dataset state and Python matrices before the next
             # product, then capture whether the process RSS actually falls.
             classifier.booster_.free_dataset()
-            del classifier, X, y, frame, callbacks
+            del classifier, X, y, frame
             gc.collect()
             metrics["rss_after_cleanup_bytes"] = _rss_bytes()
             (directory / "training_metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
@@ -232,3 +262,46 @@ def _rss_bytes() -> int | None:
 
 def _format_bytes(value: int | None) -> str:
     return "unavailable" if value is None else f"{value / 1024**3:.2f}GiB"
+
+
+def _mem_available_bytes() -> int | None:
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) * 1024
+    except (FileNotFoundError, IndexError, OSError, ValueError):
+        pass
+    return None
+
+
+class _MemoryMonitor:
+    """Persist RSS/system-memory samples while C++ LightGBM code is running."""
+
+    def __init__(self, path: Path, interval_seconds: float = 0.5) -> None:
+        self.path = path
+        self.interval_seconds = interval_seconds
+        self.peak_rss_bytes: int | None = None
+        self.min_mem_available_bytes: int | None = None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._sample, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=self.interval_seconds * 3)
+
+    def _sample(self) -> None:
+        with self.path.open("a", encoding="utf-8") as handle:
+            while not self._stop.is_set():
+                rss, available = _rss_bytes(), _mem_available_bytes()
+                if rss is not None:
+                    self.peak_rss_bytes = max(self.peak_rss_bytes or 0, rss)
+                if available is not None:
+                    self.min_mem_available_bytes = min(self.min_mem_available_bytes or available, available)
+                handle.write(json.dumps({"timestamp": time.time(), "rss_bytes": rss, "mem_available_bytes": available}) + "\n")
+                handle.flush()
+                self._stop.wait(self.interval_seconds)

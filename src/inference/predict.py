@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 import pickle
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -16,13 +16,23 @@ class InputSchema:
     feature_names: list[str]
     dtypes: dict[str, str]
     version: str
+    # Vocabulary is semantic data, not a user-managed numeric encoding.  It
+    # lets pandas construct the same categorical schema at train and infer.
+    category_values: dict[str, list[Any]] = field(default_factory=dict)
 
     def validate(self, frame: pd.DataFrame) -> pd.DataFrame:
         missing = [c for c in self.feature_names if c not in frame.columns]
         extra = [c for c in frame.columns if c not in self.feature_names]
         if missing or extra:
             raise ValueError(f"Input schema mismatch; missing={missing}, unexpected={extra}")
-        ordered = frame.loc[:, self.feature_names]
+        ordered = frame.loc[:, self.feature_names].copy()
+        for column, categories in self.category_values.items():
+            if column not in ordered:
+                continue
+            # Values unseen during training become NaN, which LightGBM handles
+            # as its native missing branch.  Known categories retain precisely
+            # the training vocabulary and unordered category semantics.
+            ordered[column] = pd.Categorical(ordered[column], categories=categories)
         wrong = {c: (str(ordered[c].dtype), self.dtypes[c]) for c in self.feature_names if str(ordered[c].dtype) != self.dtypes[c]}
         if wrong:
             raise TypeError(f"Input datatype mismatch: {wrong}")

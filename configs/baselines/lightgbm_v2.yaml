@@ -22,7 +22,9 @@ competition:
   top_k: 7
 
 features:
-  force_process: false
+  # Rebuild once so the persisted panel replaces legacy hashed categoricals
+  # with semantic category values. Set false again after this clean run.
+  force_process: true
 
 model:
   version: lightgbm-binary-v2-history-persona
@@ -40,9 +42,9 @@ model:
   # Keep all acquisition events; cap only eligible negatives per product.
   # This is the active cap in Colab; for products below 500k acquisitions it
   # is equivalent to min(500k, 1M - positive_samples).
-  max_negative_rows_per_product: 500000
+  max_negative_rows_per_product: 50000
   # Hard upper bound for positives plus negatives in each product model.
-  max_total_rows_per_product: 1000000
+  max_total_rows_per_product: 100000
 
 runtime:
   memory_limit: 4GB

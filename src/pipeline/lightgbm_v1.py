@@ -60,6 +60,7 @@ def run_lightgbm_v1(
     with progress.stage("train"):
         models = train_product_classifiers(
             panel_path, artifacts / "models", model_version=str(model["version"]),
+            product_names=model.get("products"),
             max_rows_per_product=model.get("max_rows_per_product"),
             max_negative_rows_per_product=model.get("max_negative_rows_per_product"),
             max_total_rows_per_product=model.get("max_total_rows_per_product"),

@@ -95,13 +95,15 @@ def persona_feature_projection_sql(*, features: Sequence[str] = PERSONA_FEATURES
         "customer_segment": text("segmento"),
         "profile_missing_structural": "CAST((" + " AND ".join(f"{raw(name)} IS NULL" for name in structural) + ") AS TINYINT)",
     }
-    categorical = set(CATEGORICAL_PERSONA_FEATURES)
     projections = []
     for name in features:
         value = values[name]
-        # snapshot_month already is the documented [1, 12] categorical code;
-        # preserve it instead of replacing its interpretable value with a hash.
-        if name in categorical and name != "snapshot_month":
-            value = f"CAST(hash(COALESCE(CAST({value} AS VARCHAR), '__MISSING__')) % 2147483647 AS INTEGER)"
+        # Keep model-panel categoricals as their meaningful values.  The
+        # LightGBM adapter turns them into Pandas ``category`` columns at the
+        # model boundary, where LightGBM assigns compact internal codes.
+        # A missing profile value was previously represented explicitly by the
+        # hash input; preserve that semantic state without hashing it.
+        if name in CATEGORICAL_PERSONA_FEATURES and name != "snapshot_month":
+            value = f"COALESCE(CAST({value} AS VARCHAR), 'MISSING')"
         projections.append(f"{value} AS {quote(name)}")
     return ", ".join(projections)
