@@ -31,6 +31,8 @@ def train_product_classifiers(
     max_total_rows_per_product: int | None = None,
     random_state: int = 42,
     negative_sampling_strategy: str = "head",
+    train_before_date: str | None = None,
+    use_preselected_samples: bool = False,
     n_estimators: int = 300,
     n_jobs: int = 1,
     memory_limit: str | None = None,
@@ -76,7 +78,7 @@ def train_product_classifiers(
         products = [product for product in all_products if product in requested_products]
         if not products:
             raise ValueError("At least one product must be selected for training.")
-        default_features = [c for c in columns if c not in { *MODEL_METADATA_COLUMNS, *["acq_" + p for p in all_products]}]
+        default_features = [c for c in columns if c not in { *MODEL_METADATA_COLUMNS, *["acq_" + p for p in all_products]} and not c.startswith("sampled_for_")]
         selected = list(feature_names or default_features)
         forbidden = set(selected).intersection(MODEL_METADATA_COLUMNS)
         if forbidden:
@@ -92,6 +94,9 @@ def train_product_classifiers(
             raise ValueError("training_log_period must be non-negative.")
         if negative_sampling_strategy not in {"head", "random"}:
             raise ValueError("negative_sampling_strategy must be either 'head' or 'random'.")
+        if train_before_date is not None:
+            from datetime import date
+            date.fromisoformat(train_before_date)
         result: dict[str, str] = {}
         training_started = time.perf_counter()
         if max_total_rows_per_product is not None and max_total_rows_per_product <= 0:
@@ -117,8 +122,13 @@ def train_product_classifiers(
             projection = f"{projection}, {label_projection}"
             transition_filter = "record_gap_months = 1 AND " if require_adjacent_month else "previous_observation = 1 AND "
             eligibility = f'{transition_filter}COALESCE({_quote("prev_" + product)}, 0) = 0'
+            if train_before_date is not None:
+                cutoff = train_before_date.replace("'", "''")
+                eligibility += f" AND CAST(fecha_dato AS DATE) < CAST('{cutoff}' AS DATE)"
+            if use_preselected_samples:
+                eligibility += f' AND ({label_name} = 1 OR COALESCE({_quote("sampled_for_" + product)}, 0) = 1)'
             query = f'SELECT {projection} FROM read_parquet(?) WHERE {eligibility}'
-            if max_total_rows_per_product is not None or max_negative_rows_per_product:
+            if not use_preselected_samples and (max_total_rows_per_product is not None or max_negative_rows_per_product):
                 label = _quote("acq_" + product)
                 positive_count = int(con.execute(
                     f'SELECT COUNT(*) FROM read_parquet(?) WHERE {eligibility} AND {label} = 1',
@@ -153,7 +163,7 @@ def train_product_classifiers(
                 )
             elif max_rows_per_product:
                 query += f" LIMIT {int(max_rows_per_product)}"
-            uses_two_sources = max_total_rows_per_product is not None or bool(max_negative_rows_per_product)
+            uses_two_sources = not use_preselected_samples and (max_total_rows_per_product is not None or bool(max_negative_rows_per_product))
             parameters = [str(source), str(source)] if uses_two_sources else [str(source)]
             rss_before_load = _rss_bytes()
             frame = con.execute(query, parameters).fetchdf()

@@ -13,7 +13,7 @@ import duckdb
 from src.data.gcs_storage import download_object_if_missing, object_name, upload_directory, upload_file
 from src.data.preprocessing import preprocess_customer_profiles
 from src.ingestion.checkpoint import build_interim_checkpoint
-from src.models.popularity import run_popularity_baseline
+from src.models.popularity import run_popularity_baseline, run_popularity_competition
 from src.splits.temporal import build_validation_split
 from src.tracking.progress import PipelineProgress
 from src.tracking.run_context import build_run_manifest, create_run_id, write_run_manifest
@@ -34,7 +34,7 @@ def run_baseline_v0(config: Mapping[str, Any], *, resolved_config_path: str | Pa
     run_id = create_run_id("baseline-v0")
     artifacts = paths["artifact_root"] / run_id
     artifacts.mkdir(parents=True, exist_ok=True)
-    progress = PipelineProgress(paths["artifact_root"] / "pipeline_timing.json", ["gcs_raw_cache", "ingest", "split", "preprocessing", "train_evaluate", "upload_artifacts"])
+    progress = PipelineProgress(paths["artifact_root"] / "pipeline_timing.json", ["gcs_raw_cache", "ingest", "split", "preprocessing", "train_evaluate", "competition_submission", "upload_artifacts"])
     storage, runtime = config["storage"], config["runtime"]
     raw_path = paths["raw_train"]
     raw_object = object_name(storage["raw_prefix"], Path(config["data"]["raw_train_filename"]))
@@ -59,10 +59,23 @@ def run_baseline_v0(config: Mapping[str, Any], *, resolved_config_path: str | Pa
         model = run_popularity_baseline(scoring_panel, artifacts, validation_date=str(config["split"]["validation_date"]), top_k=int(config["model"]["top_k"]), memory_limit=runtime.get("memory_limit"), temp_directory=run_scratch, threads=int(runtime.get("threads", 1)))
         scoring_panel.unlink(missing_ok=True)
         shutil.rmtree(run_scratch, ignore_errors=True)
+    with progress.stage("competition_submission"):
+        competition = config["competition"]
+        test_checkpoint = build_interim_checkpoint(
+            paths["raw_dir"] / competition["raw_test_filename"], paths["interim_test"],
+            chunksize=int(config["ingestion"]["chunksize"]), force_rebuild=bool(competition.get("force_rebuild", False)),
+            show_progress=bool(config["ingestion"].get("show_progress", True)),
+        )
+        submission = run_popularity_competition(
+            interim["interim"], test_checkpoint["interim"],
+            paths["raw_dir"] / competition["sample_submission_filename"], artifacts / "submission.csv",
+            history_date=str(competition["history_date"]), top_k=int(competition.get("top_k", 7)),
+            memory_limit=runtime.get("memory_limit"), temp_directory=_temp_path(runtime),
+        )
     resolved_copy = artifacts / "config_resolved.yaml"
     resolved_copy.write_text(yaml.safe_dump(dict(config), sort_keys=False), encoding="utf-8")
     manifest_path = artifacts / "lineage_manifest.json"
-    manifest = build_run_manifest(run_id=run_id, config=config, inputs={"raw_train": raw_path, "source_train": interim["interim"], "split_train": split["train"], "validation_input": split["validation_input"], "validation_target": split["validation_target"]}, outputs={"profile_train": profiles["train"], "metrics": model["metrics_path"], "ranking": artifacts / "popularity_ranking.parquet", "predictions": artifacts / "validation_predictions.parquet", "resolved_config": resolved_copy})
+    manifest = build_run_manifest(run_id=run_id, config=config, inputs={"raw_train": raw_path, "source_train": interim["interim"], "split_train": split["train"], "validation_input": split["validation_input"], "validation_target": split["validation_target"]}, outputs={"profile_train": profiles["train"], "metrics": model["metrics_path"], "ranking": artifacts / "popularity_ranking.parquet", "predictions": artifacts / "validation_predictions.parquet", "submission": submission, "resolved_config": resolved_copy})
     write_run_manifest(manifest, manifest_path)
     mlflow_run_id = None
     tracking = config.get("tracking", {}).get("mlflow", {})
@@ -72,13 +85,32 @@ def run_baseline_v0(config: Mapping[str, Any], *, resolved_config_path: str | Pa
     with progress.stage("upload_artifacts"):
         artifact_uris = _upload_artifacts_if_enabled(artifacts, storage, run_id)
     progress.save()
-    return {"run_id": run_id, "raw_downloaded": str(downloaded) if downloaded else None, "interim": interim, "interim_gcs_uri": interim_uri, "profiles": profiles, "profile_gcs_uris": profile_uris, "split": split, "split_gcs_uris": split_uris, "model": model, "mlflow_run_id": mlflow_run_id, "artifacts": str(artifacts), "artifact_gcs_uris": artifact_uris, "manifest": str(manifest_path)}
+    return {"run_id": run_id, "raw_downloaded": str(downloaded) if downloaded else None, "interim": interim, "interim_gcs_uri": interim_uri, "profiles": profiles, "profile_gcs_uris": profile_uris, "split": split, "split_gcs_uris": split_uris, "model": model, "submission": str(submission), "mlflow_run_id": mlflow_run_id, "artifacts": str(artifacts), "artifact_gcs_uris": artifact_uris, "manifest": str(manifest_path)}
+
+
+def run_baseline_v0_competition_from_config(config_path: str | Path = "configs/baselines/v0.yaml") -> Path:
+    """Create a competition submission from the cached v0 popularity inputs."""
+    path = Path(config_path)
+    config = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if not isinstance(config, dict):
+        raise ValueError("Baseline config must be a YAML mapping.")
+    config = _resolve_environment(config)
+    competition = config["competition"]
+    root = Path(os.getenv("SANTANDER_DATA_ROOT", "data"))
+    raw_dir, interim_dir = root / config["data"]["raw_dir"], root / config["data"]["interim_dir"]
+    test_checkpoint = build_interim_checkpoint(raw_dir / competition["raw_test_filename"], interim_dir / "test.parquet", chunksize=int(config["ingestion"]["chunksize"]), force_rebuild=bool(competition.get("force_rebuild", False)), show_progress=bool(config["ingestion"].get("show_progress", True)))
+    output = root / config["data"]["artifact_dir"] / "baseline_v0_competition_submission.csv"
+    return run_popularity_competition(
+        interim_dir / "train.parquet", test_checkpoint["interim"], raw_dir / competition["sample_submission_filename"], output,
+        history_date=str(competition["history_date"]), top_k=int(competition.get("top_k", 7)),
+        memory_limit=config["runtime"].get("memory_limit"), temp_directory=_temp_path(config["runtime"]),
+    )
 
 
 def _paths(config: Mapping[str, Any]) -> dict[str, Path]:
     root = Path(os.getenv("SANTANDER_DATA_ROOT", "data"))
     data = config["data"]
-    return {"raw_train": root / data["raw_dir"] / data["raw_train_filename"], "source_train": root / data["interim_dir"] / "train.parquet", "split_dir": root / data["interim_dir"] / "splits" / config["split"]["name"], "profile_dir": root / data["processed_dir"] / "baseline_v0" / "profiles", "artifact_root": root / data["artifact_dir"] / "runs"}
+    return {"raw_dir": root / data["raw_dir"], "raw_train": root / data["raw_dir"] / data["raw_train_filename"], "source_train": root / data["interim_dir"] / "train.parquet", "interim_test": root / data["interim_dir"] / "test.parquet", "split_dir": root / data["interim_dir"] / "splits" / config["split"]["name"], "profile_dir": root / data["processed_dir"] / "baseline_v0" / "profiles", "artifact_root": root / data["artifact_dir"] / "runs"}
 
 
 def _materialize_scoring_panel(split: Mapping[str, object], destination: Path, runtime: Mapping[str, Any]) -> Path:
@@ -117,13 +149,20 @@ def _upload_artifacts_if_enabled(path: str | Path, storage: Mapping[str, Any], r
 
 
 def _resolve_environment(value: Any) -> Any:
-    """Replace ${NAME} config values from bootstrap-provided environment variables."""
+    """Resolve simple and Hydra-style environment placeholders in YAML values."""
     if isinstance(value, dict): return {key: _resolve_environment(item) for key, item in value.items()}
     if isinstance(value, list): return [_resolve_environment(item) for item in value]
     if not isinstance(value, str): return value
-    def replace(match: re.Match[str]) -> str:
+    def hydra_replace(match: re.Match[str]) -> str:
+        name, default = match.group(1), match.group(2)
+        return os.getenv(name, default)
+
+    def required_replace(match: re.Match[str]) -> str:
         name = match.group(1)
         resolved = os.getenv(name)
-        if not resolved: raise ValueError(f"Missing required environment variable: {name}")
+        if not resolved:
+            raise ValueError(f"Missing required environment variable: {name}")
         return resolved
-    return re.sub(r"\$\{([A-Z0-9_]+)\}", replace, value)
+
+    value = re.sub(r"\$\{oc\.env:([A-Z0-9_]+),([^}]+)\}", hydra_replace, value)
+    return re.sub(r"\$\{([A-Z0-9_]+)\}", required_replace, value)

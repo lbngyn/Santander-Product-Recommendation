@@ -159,7 +159,11 @@ def transform_customer_profiles(
         temporary = destination.with_suffix(destination.suffix + ".tmp")
         if temporary.exists():
             temporary.unlink()
-        con.execute(f"COPY ({query}) TO ? (FORMAT PARQUET, COMPRESSION ZSTD)", [str(temporary)])
+        # DuckDB does not bind a COPY destination through ``?``. Keep the
+        # value quoted/escaped rather than concatenating an untrusted path.
+        con.execute(
+            f"COPY ({query}) TO '{_quote_path(temporary)}' (FORMAT PARQUET, COMPRESSION ZSTD)"
+        )
         temporary.replace(destination)
         return destination
     finally:

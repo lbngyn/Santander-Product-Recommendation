@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 import duckdb
+import pandas as pd
 
 
 def run_popularity_baseline(
@@ -109,6 +110,69 @@ def run_popularity_baseline(
         return {"output_dir": str(destination), "products": products, "metrics": metrics, "metrics_path": str(metrics_path)}
     finally:
         con.close()
+
+
+def run_popularity_competition(
+    history_path: str | Path,
+    test_path: str | Path,
+    sample_submission_path: str | Path,
+    output_path: str | Path,
+    *,
+    history_date: str,
+    top_k: int = 7,
+    memory_limit: str | None = None,
+    temp_directory: str | Path | None = None,
+) -> Path:
+    """Create a competition-format Top-K CSV from historical product popularity."""
+    history, test, template_path, destination = map(Path, (history_path, test_path, sample_submission_path, output_path))
+    if not history.is_file() or not test.is_file() or not template_path.is_file():
+        raise FileNotFoundError("History, test and sample submission files are all required.")
+    con = duckdb.connect(database=":memory:")
+    try:
+        _configure(con, memory_limit, temp_directory, None)
+        products = [column for column in _columns(con, history) if column.endswith("_ult1")]
+        if not products:
+            raise ValueError("History checkpoint has no product columns ending in '_ult1'.")
+        values = ", ".join(f"('{product}', TRY_CAST(\"{product}\" AS TINYINT), TRY_CAST(\"previous_{product}\" AS TINYINT))" for product in products)
+        ownership = "CASE popularity.product " + " ".join(f"WHEN '{product}' THEN COALESCE(latest.\"{product}\", 0)" for product in products) + " ELSE 0 END"
+        history_sql, test_sql = _path(history), _path(test)
+        query = f"""
+            WITH history_rows AS (
+                SELECT * FROM read_parquet('{history_sql}') WHERE CAST(fecha_dato AS DATE) <= CAST(? AS DATE)
+            ), ordered AS (
+                SELECT *, LAG(fecha_dato) OVER customer_time AS previous_date,
+                       {', '.join(f'LAG("{product}") OVER customer_time AS "previous_{product}"' for product in products)}
+                FROM history_rows WINDOW customer_time AS (PARTITION BY ncodpers ORDER BY fecha_dato)
+            ), popularity AS (
+                SELECT product, SUM(CASE WHEN value = 1 AND COALESCE(previous_value, 0) = 0 THEN 1 ELSE 0 END) AS purchases
+                FROM ordered CROSS JOIN LATERAL (VALUES {values}) AS v(product, value, previous_value)
+                WHERE previous_date IS NOT NULL GROUP BY product
+            ), latest AS (
+                SELECT * EXCLUDE (row_number) FROM (
+                    SELECT *, ROW_NUMBER() OVER (PARTITION BY ncodpers ORDER BY fecha_dato DESC) AS row_number FROM history_rows
+                ) WHERE row_number = 1
+            ), candidates AS (
+                SELECT test.ncodpers, popularity.product, popularity.purchases,
+                       ROW_NUMBER() OVER (PARTITION BY test.ncodpers ORDER BY popularity.purchases DESC, popularity.product) AS rank
+                FROM read_parquet('{test_sql}') AS test CROSS JOIN popularity
+                LEFT JOIN latest USING (ncodpers)
+                WHERE {ownership} = 0
+            )
+            SELECT ncodpers, COALESCE(string_agg(product, ' ' ORDER BY rank), '') AS added_products
+            FROM candidates WHERE rank <= {int(top_k)} GROUP BY ncodpers
+        """
+        recommendations = con.execute(query, [history_date]).fetchdf()
+    finally:
+        con.close()
+    template = pd.read_csv(template_path)
+    if list(template.columns) != ["ncodpers", "added_products"] or template["ncodpers"].duplicated().any():
+        raise ValueError("sample_submission must contain unique ncodpers and added_products columns.")
+    output = template[["ncodpers"]].merge(recommendations, on="ncodpers", how="left", validate="one_to_one")
+    if output["added_products"].isna().any():
+        raise ValueError("sample_submission contains customers absent from test data.")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    output.to_csv(destination, index=False)
+    return destination
 
 
 def _map_at_k(con: duckdb.DuckDBPyConnection, predictions: Path, actual: Path, customers: int, top_k: int) -> dict[str, float]:

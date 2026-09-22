@@ -124,7 +124,9 @@ def transform_customer_profiles_bidirectional(
         temporary = destination.with_suffix(destination.suffix + ".tmp")
         if temporary.exists():
             temporary.unlink()
-        con.execute(f"COPY ({query}) TO ? (FORMAT PARQUET, COMPRESSION ZSTD)", [str(temporary)])
+        con.execute(
+            f"COPY ({query}) TO '{_quote_path(temporary)}' (FORMAT PARQUET, COMPRESSION ZSTD)"
+        )
         temporary.replace(destination)
         return destination
     finally:

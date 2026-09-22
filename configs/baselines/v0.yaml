@@ -9,8 +9,8 @@ storage:
   raw_prefix: ${oc.env:GCS_RAW_PREFIX}
   checkpoint_prefix: ${oc.env:GCS_CHECKPOINT_PREFIX}
   artifact_prefix: santander/artifacts/baseline_v0
-  upload_checkpoints: true
-  upload_artifacts: true
+  upload_checkpoints: false
+  upload_artifacts: false
 
 # These paths are relative to SANTANDER_DATA_ROOT (Google Drive in Colab).
 data:
@@ -43,6 +43,13 @@ model:
 evaluation:
   metric: map_at_7
   target: additional_products
+
+competition:
+  raw_test_filename: test_ver2.csv
+  sample_submission_filename: sample_submission.csv
+  history_date: 2016-05-28
+  top_k: 7
+  force_rebuild: false
 
 runtime:
   memory_limit: 2GB

@@ -17,6 +17,7 @@ from src.submission.competition import run_competition_test_inference
 from src.submission.prepare import load_competition_input, materialize_competition_test_input
 from src.tracking.progress import PipelineProgress
 from src.tracking.run_context import build_run_manifest, create_run_id, write_run_manifest
+from src.evaluation.recommendation import evaluate_independent_models
 
 
 def run_lightgbm_v1_from_config(config_path: str | Path = "configs/baselines/lightgbm_v1.yaml") -> dict[str, Any]:
@@ -51,10 +52,14 @@ def run_lightgbm_v1(
     artifacts = artifact_root / run_id
     artifacts.mkdir(parents=True, exist_ok=True)
     progress = PipelineProgress(artifact_root / "pipeline_timing.json", ["model_panel", "train", "tracking"])
+    feature_config = config.get("features", {})
+    selection_config = None
+    if feature_config.get("preselect_training_samples", False):
+        selection_config = {"validation_date": str(config["split"]["validation_date"]), "max_negative_rows_per_product": model.get("max_negative_rows_per_product"), "random_state": int(model.get("random_state", 42))}
     with progress.stage("model_panel"):
         panel_path = panel_builder(
             source, panel,
-            force_process=bool(config.get("features", {}).get("force_process", False)),
+            force_process=bool(feature_config.get("force_process", False)), selection_config=selection_config,
             memory_limit=runtime.get("memory_limit"), temp_directory=runtime.get("temp_directory"),
         )
     with progress.stage("train"):
@@ -66,6 +71,8 @@ def run_lightgbm_v1(
             max_total_rows_per_product=model.get("max_total_rows_per_product"),
             random_state=int(model.get("random_state", 42)),
             negative_sampling_strategy=str(model.get("negative_sampling_strategy", "head")),
+            train_before_date=str(config["split"]["validation_date"]) if config.get("split", {}).get("validation_date") else None,
+            use_preselected_samples=bool(feature_config.get("preselect_training_samples", False)),
             n_estimators=int(model.get("n_estimators", 300)), n_jobs=int(runtime.get("threads", 1)),
             memory_limit=runtime.get("memory_limit"), temp_directory=runtime.get("temp_directory"),
             lightgbm_params=model.get("lightgbm_params"),
@@ -75,9 +82,17 @@ def run_lightgbm_v1(
         )
     model_index = artifacts / "model_artifacts.json"
     model_index.write_text(json.dumps(models, indent=2, sort_keys=True), encoding="utf-8")
+    validation_metrics: dict[str, float | int | str] = {}
+    split = config.get("split", {})
+    if split.get("validation_date"):
+        validation_metrics = evaluate_independent_models(
+            panel_path, models, artifacts,
+            validation_date=str(split["validation_date"]),
+            top_k=int(config.get("competition", {}).get("top_k", 7)),
+        )
     resolved_copy = artifacts / "config_resolved.yaml"
     resolved_copy.write_text(yaml.safe_dump(dict(config), sort_keys=False), encoding="utf-8")
-    manifest = build_run_manifest(run_id=run_id, config=config, inputs={"source_train": source, "model_panel": panel_path, "declared_config": resolved_config_path}, outputs={"resolved_config": resolved_copy, "model_index": model_index})
+    manifest = build_run_manifest(run_id=run_id, config=config, inputs={"source_train": source, "model_panel": panel_path, "declared_config": resolved_config_path}, outputs={"resolved_config": resolved_copy, "model_index": model_index, "validation_metrics": artifacts / "validation_metrics.json", "validation_recommendations": artifacts / "validation_recommendations.csv"})
     manifest["description"] = description
     manifest["pipeline_version"] = version
     manifest["model_version"] = str(model["version"])
@@ -86,18 +101,19 @@ def run_lightgbm_v1(
     with progress.stage("tracking"):
         tracking = config.get("tracking", {}).get("mlflow", {})
         if tracking.get("enabled", False):
-            from src.tracking.mlflow_utils import log_baseline_run
-            mlflow_run_id = log_baseline_run(
+            from src.tracking.mlflow_utils import log_lightgbm_run
+            mlflow_run_id = log_lightgbm_run(
                 experiment_name=str(tracking["experiment_name"]),
                 tracking_uri=str(tracking["tracking_uri"]),
                 manifest_path=manifest_path,
                 config_path=resolved_copy,
                 artifact_dir=artifacts,
-                metrics={},
+                model_config=model,
+                validation_metrics=validation_metrics,
                 tags={"run_id": run_id, "pipeline_version": version, "model_version": model["version"], "description": description},
             )
     progress.save()
-    return {"run_id": run_id, "description": description, "pipeline_version": version, "model_version": model["version"], "model_panel": str(panel_path), "models": models, "artifacts": str(artifacts), "manifest": str(manifest_path), "mlflow_run_id": mlflow_run_id}
+    return {"run_id": run_id, "description": description, "pipeline_version": version, "model_version": model["version"], "model_panel": str(panel_path), "models": models, "validation": validation_metrics, "artifacts": str(artifacts), "manifest": str(manifest_path), "mlflow_run_id": mlflow_run_id}
 
 
 def run_lightgbm_v1_competition_from_config(

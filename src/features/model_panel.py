@@ -11,7 +11,7 @@ from src.features.history_features import customer_history_length_window_sql, re
 from src.features.persona import PERSONA_FEATURES, persona_feature_projection_sql, raw_persona_projection_sql
 
 
-def build_model_panel(source_path: str | Path, destination_path: str | Path, *, history_feature_sql: Sequence[str], force_process: bool = False, memory_limit: str | None = None, temp_directory: str | Path | None = None) -> Path:
+def build_model_panel(source_path: str | Path, destination_path: str | Path, *, history_feature_sql: Sequence[str], selected_rows_sql: str | None = None, selection_columns: Sequence[str] = (), force_process: bool = False, memory_limit: str | None = None, temp_directory: str | Path | None = None) -> Path:
     """Materialise sample ``t`` using profiles at ``t`` and history before it.
 
     Acquisition/drop events and derived RFM features are valid only where the
@@ -51,15 +51,24 @@ def build_model_panel(source_path: str | Path, destination_path: str | Path, *, 
         drop_events = product_event_count_sql(products, event="drop")
         selected_history_features = ",\n                       ".join(history_feature_sql)
         source_sql = str(source).replace("'", "''")
+        selection_projection = ", ".join(f"selection.{quote(name)}" for name in selection_columns)
+        selection_ctes = ""
+        source_join = ""
+        final_join = ""
+        if selected_rows_sql:
+            selection_sql = selected_rows_sql.replace("{source_path}", source_sql)
+            selection_ctes = f"selection AS ({selection_sql}), selected_customers AS (SELECT DISTINCT ncodpers FROM selection),"
+            source_join = "INNER JOIN selected_customers USING (ncodpers)"
+            final_join = "INNER JOIN selection USING (ncodpers, fecha_dato)"
         temporary = destination.with_suffix(destination.suffix + ".tmp")
         if temporary.exists():
             temporary.unlink()
         temporary_sql = str(temporary).replace("'", "''")
         con.execute(f"""
             COPY (
-                WITH source_rows AS (
+                WITH {selection_ctes} source_rows AS (
                     SELECT source.ncodpers, source.fecha_dato, {raw_persona_sql}, {product_sql}
-                    FROM read_parquet('{source_sql}') AS source
+                    FROM read_parquet('{source_sql}') AS source {source_join}
                 ), ordered AS (
                     SELECT *, {persona_sql}, LAG(fecha_dato) OVER customer_time AS previous_date,
                            {customer_history_length_window_sql()},
@@ -77,8 +86,8 @@ def build_model_panel(source_path: str | Path, destination_path: str | Path, *, 
                        CAST(previous_date IS NOT NULL AS TINYINT) AS previous_observation,
                        {previous_states},
                        {selected_history_features},
-                       {labels}
-                FROM events
+                       {labels}{', ' if selection_projection else ''}{selection_projection}
+                FROM events {final_join}
                 WINDOW prior_rows AS (PARTITION BY ncodpers ORDER BY fecha_dato ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING),
                        recent_1m AS (PARTITION BY ncodpers ORDER BY CAST(fecha_dato AS DATE) RANGE BETWEEN INTERVAL 1 MONTH PRECEDING AND INTERVAL 1 DAY PRECEDING),
                        recent_3m AS (PARTITION BY ncodpers ORDER BY CAST(fecha_dato AS DATE) RANGE BETWEEN INTERVAL 3 MONTH PRECEDING AND INTERVAL 1 DAY PRECEDING),

@@ -12,7 +12,7 @@ import hydra
 from omegaconf import DictConfig, OmegaConf
 from dotenv import load_dotenv
 
-from src.pipeline.baseline_v0 import run_baseline_v0
+from src.pipeline.baseline_v0 import run_baseline_v0, run_baseline_v0_competition_from_config
 
 load_dotenv(PROJECT_ROOT / ".env")
 

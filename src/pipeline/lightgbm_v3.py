@@ -60,6 +60,7 @@ def build_lightgbm_v3_panel(source_path: str | Path, destination_path: str | Pat
     expressions below over windows ending at the preceding customer record.
     """
     products = _product_columns(source_path)
+    selection_config = kwargs.pop("selection_config", None)
     history_features = [
         record_gap_months_sql(output=True),
         customer_history_length_sql(),
@@ -72,7 +73,45 @@ def build_lightgbm_v3_panel(source_path: str | Path, destination_path: str | Pat
         acquisitions_last_6m_sql(),
         cumulative_drops_sql(),
     ]
-    return build_model_panel(source_path, destination_path, history_feature_sql=history_features, **kwargs)
+    selected_rows_sql, selection_columns = _selected_rows_sql(products, selection_config) if selection_config else (None, ())
+    return build_model_panel(source_path, destination_path, history_feature_sql=history_features, selected_rows_sql=selected_rows_sql, selection_columns=selection_columns, **kwargs)
+
+
+def _selected_rows_sql(products: list[str], config: Mapping[str, Any]) -> tuple[str, tuple[str, ...]]:
+    """Select V3 train keys before feature materialisation; history remains context."""
+    validation_date = str(config["validation_date"]).replace("'", "''")
+    negative_limit = int(config["max_negative_rows_per_product"])
+    seed = int(config["random_state"])
+    values = ", ".join(f"('{product}', COALESCE(TRY_CAST(\"{product}\" AS TINYINT), 0), COALESCE(TRY_CAST(\"previous_{product}\" AS TINYINT), 0), {index})" for index, product in enumerate(products, start=1))
+    flags = tuple("sampled_for_" + product for product in products)
+    flag_sql = ", ".join(f"CAST(MAX(CASE WHEN product = '{product}' AND is_negative = 1 THEN 1 ELSE 0 END) AS TINYINT) AS \"sampled_for_{product}\"" for product in products)
+    sql = f"""
+        WITH ordered AS (
+            SELECT ncodpers, fecha_dato, LAG(fecha_dato) OVER customer_time AS previous_date,
+                   {', '.join(f'\"{product}\", LAG(\"{product}\") OVER customer_time AS \"previous_{product}\"' for product in products)}
+            FROM read_parquet('{{source_path}}')
+            WINDOW customer_time AS (PARTITION BY ncodpers ORDER BY fecha_dato)
+        ), candidate_events AS (
+            SELECT ncodpers, fecha_dato, product,
+                   CAST(current_value = 1 AND previous_value = 0 AS TINYINT) AS label,
+                   product_ordinal
+            FROM ordered CROSS JOIN LATERAL (VALUES {values}) AS v(product, current_value, previous_value, product_ordinal)
+            WHERE date_diff('month', CAST(previous_date AS DATE), CAST(fecha_dato AS DATE)) = 1
+              AND previous_value = 0 AND CAST(fecha_dato AS DATE) < CAST('{validation_date}' AS DATE)
+        ), sampled AS (
+            SELECT *, CASE WHEN label = 0 AND ROW_NUMBER() OVER (PARTITION BY product ORDER BY hash(ncodpers, fecha_dato, {seed} + product_ordinal), ncodpers, fecha_dato) <= {negative_limit} THEN 1 ELSE 0 END AS is_negative
+            FROM candidate_events
+        ), selected_train AS (
+            SELECT ncodpers, fecha_dato, product, is_negative FROM sampled WHERE label = 1 OR is_negative = 1
+        ), validation_keys AS (
+            SELECT ncodpers, fecha_dato, NULL::VARCHAR AS product, 0 AS is_negative
+            FROM ordered WHERE date_diff('month', CAST(previous_date AS DATE), CAST(fecha_dato AS DATE)) = 1 AND CAST(fecha_dato AS DATE) = CAST('{validation_date}' AS DATE)
+        )
+        SELECT ncodpers, fecha_dato, {flag_sql}
+        FROM (SELECT * FROM selected_train UNION ALL SELECT * FROM validation_keys)
+        GROUP BY ncodpers, fecha_dato
+    """
+    return sql, flags
 
 
 def _product_columns(source_path: str | Path) -> list[str]:

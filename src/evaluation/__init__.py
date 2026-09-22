@@ -1,1 +1,1 @@
-"""Evaluation protocols and ranking metrics."""
+"""Evaluation contracts for temporal recommendation experiments."""

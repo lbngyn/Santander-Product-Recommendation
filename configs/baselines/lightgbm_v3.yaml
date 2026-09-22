@@ -10,6 +10,9 @@ data:
   model_panel: processed/lightgbm_v3/model_panel_persona_history.parquet
   artifact_dir: artifacts
 
+split:
+  validation_date: 2016-05-28
+
 competition:
   raw_test: raw/test_ver2.csv
   interim_test: interim/test.parquet
@@ -24,6 +27,7 @@ competition:
 
 features:
   force_process: false
+  preselect_training_samples: true
 
 model:
   version: lightgbm-binary-v3-persona-history
@@ -34,11 +38,11 @@ model:
   training_log_period: 5
   lightgbm_params:
     device_type: cpu
-    force_col_wise: true
+    force_col_wise: false
     histogram_pool_size: 512
   max_rows_per_product: null
-  max_negative_rows_per_product: 50000
-  max_total_rows_per_product: 100000
+  max_negative_rows_per_product: 500000
+  max_total_rows_per_product: 1000000
 
 runtime:
   memory_limit: 4GB
