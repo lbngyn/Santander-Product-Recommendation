@@ -1,0 +1,46 @@
+pipeline:
+  version: lightgbm-acquisition-v2-history-persona
+  description: >-
+    24 independent LightGBM acquisition classifiers using leakage-safe
+    customer-history, portfolio, frequency and recency features.
+
+data:
+  interim_train: interim/train.parquet
+  model_panel: processed/lightgbm_v2/model_panel_history_persona.parquet
+  artifact_dir: artifacts
+
+competition:
+  raw_test: raw/test_ver2.csv
+  interim_test: interim/test.parquet
+  prepared_input: processed/lightgbm_v2/competition_test_input.parquet
+  sample_submission: raw/sample_submission.csv
+  generate_template_if_missing: true
+  history_date: 2016-05-28
+  chunksize: 50000
+  force_rebuild: false
+  show_progress: true
+  top_k: 7
+
+features:
+  force_process: false
+
+model:
+  version: lightgbm-binary-v2-history-persona
+  n_estimators: 20
+  random_state: 42
+  training_log_period: 5
+  lightgbm_params:
+    device_type: cpu
+  max_rows_per_product: null
+  max_negative_rows_per_product: 500000
+
+runtime:
+  memory_limit: 4GB
+  threads: 2
+  temp_directory: data/.duckdb_tmp
+
+tracking:
+  mlflow:
+    enabled: true
+    tracking_uri: sqlite:///mlruns.db
+    experiment_name: santander-lightgbm-acquisition-v2-history-persona

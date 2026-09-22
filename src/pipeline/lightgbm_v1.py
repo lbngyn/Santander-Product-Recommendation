@@ -9,7 +9,7 @@ from typing import Any, Mapping
 import yaml
 import pandas as pd
 
-from src.features.model_panel import build_model_panel
+from src.features.model_panel_v1 import build_model_panel_v1
 from src.inference.predict import load_artifact_metadata
 from src.ingestion.checkpoint import build_interim_checkpoint
 from src.models.lightgbm_binary import train_product_classifiers
@@ -28,7 +28,14 @@ def run_lightgbm_v1_from_config(config_path: str | Path = "configs/baselines/lig
     return run_lightgbm_v1(config, resolved_config_path=path)
 
 
-def run_lightgbm_v1(config: Mapping[str, Any], *, resolved_config_path: str | Path) -> dict[str, Any]:
+def run_lightgbm_v1(
+    config: Mapping[str, Any],
+    *,
+    resolved_config_path: str | Path,
+    panel_builder: Any = build_model_panel_v1,
+    require_adjacent_month: bool = False,
+    categorical_feature_names: list[str] | None = None,
+) -> dict[str, Any]:
     """Build the leakage-safe panel, train 24 artifacts, then write lineage."""
     pipeline = config.get("pipeline", {})
     description = str(pipeline.get("description", "")).strip()
@@ -45,7 +52,7 @@ def run_lightgbm_v1(config: Mapping[str, Any], *, resolved_config_path: str | Pa
     artifacts.mkdir(parents=True, exist_ok=True)
     progress = PipelineProgress(artifact_root / "pipeline_timing.json", ["model_panel", "train", "tracking"])
     with progress.stage("model_panel"):
-        panel_path = build_model_panel(
+        panel_path = panel_builder(
             source, panel,
             force_process=bool(config.get("features", {}).get("force_process", False)),
             memory_limit=runtime.get("memory_limit"), temp_directory=runtime.get("temp_directory"),
@@ -60,6 +67,8 @@ def run_lightgbm_v1(config: Mapping[str, Any], *, resolved_config_path: str | Pa
             memory_limit=runtime.get("memory_limit"), temp_directory=runtime.get("temp_directory"),
             lightgbm_params=model.get("lightgbm_params"),
             training_log_period=int(model.get("training_log_period", 5)),
+            require_adjacent_month=require_adjacent_month,
+            categorical_feature_names=categorical_feature_names,
         )
     model_index = artifacts / "model_artifacts.json"
     model_index.write_text(json.dumps(models, indent=2, sort_keys=True), encoding="utf-8")

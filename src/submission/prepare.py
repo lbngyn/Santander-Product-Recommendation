@@ -7,6 +7,7 @@ from typing import Sequence
 import duckdb
 
 from src.features.customer_history import HISTORY_FEATURE_NAMES, product_event_count_sql
+from src.features.persona import PERSONA_FEATURES, persona_projection_sql
 
 
 def materialize_competition_test_input(
@@ -52,6 +53,8 @@ def materialize_competition_test_input(
         if not bool(con.execute("SELECT count(*) = count(DISTINCT ncodpers) FROM read_parquet(?)", [str(test)]).fetchone()[0]):
             raise ValueError("Competition test must contain one row per ncodpers.")
         q = _quote
+        requested_persona = [name for name in profile_features if name in PERSONA_FEATURES]
+        persona_sql = persona_projection_sql("test", test_columns, features=requested_persona)
         profiles = ", ".join(f"test.{q(name)}" for name in profile_features)
         previous = ", ".join(
             f"CAST(COALESCE(history.{q(product)}, 0) AS TINYINT) AS {q('prev_' + product)}"
@@ -73,7 +76,10 @@ def materialize_competition_test_input(
         con.execute(
             f"""
             COPY (
-                WITH history_base AS (
+                WITH test_rows AS (
+                    SELECT test.ncodpers, test.fecha_dato{', ' if persona_sql else ''}{persona_sql}
+                    FROM read_parquet('{test_sql}') AS test
+                ), history_base AS (
                     SELECT * FROM read_parquet('{history_sql}')
                     WHERE CAST(fecha_dato AS DATE) <= CAST('{history_date_sql}' AS DATE)
                 ), ordered AS (
@@ -102,7 +108,7 @@ def materialize_competition_test_input(
                            COALESCE(SUM(CASE WHEN CAST(events.fecha_dato AS DATE) >= CAST(test.fecha_dato AS DATE) - INTERVAL 1 MONTH THEN events.acquisition_events ELSE 0 END), 0) AS acquisitions_last_1m,
                            COALESCE(SUM(CASE WHEN CAST(events.fecha_dato AS DATE) >= CAST(test.fecha_dato AS DATE) - INTERVAL 3 MONTH THEN events.acquisition_events ELSE 0 END), 0) AS acquisitions_last_3m,
                            COALESCE(SUM(CASE WHEN CAST(events.fecha_dato AS DATE) >= CAST(test.fecha_dato AS DATE) - INTERVAL 6 MONTH THEN events.acquisition_events ELSE 0 END), 0) AS acquisitions_last_6m
-                    FROM read_parquet('{test_sql}') AS test
+                    FROM test_rows AS test
                     LEFT JOIN events ON test.ncodpers = events.ncodpers
                         AND CAST(events.fecha_dato AS DATE) < CAST(test.fecha_dato AS DATE)
                     GROUP BY test.ncodpers
@@ -118,7 +124,7 @@ def materialize_competition_test_input(
                        , CAST(COALESCE(recent.acquisitions_last_1m, 0) AS INTEGER) AS acquisitions_last_1m
                        , CAST(COALESCE(recent.acquisitions_last_3m, 0) AS INTEGER) AS acquisitions_last_3m
                        , CAST(COALESCE(recent.acquisitions_last_6m, 0) AS INTEGER) AS acquisitions_last_6m
-                FROM read_parquet('{test_sql}') AS test
+                FROM test_rows AS test
                 LEFT JOIN latest_history AS history USING (ncodpers)
                 LEFT JOIN history_summary AS summary USING (ncodpers)
                 LEFT JOIN recent_acquisitions AS recent USING (ncodpers)

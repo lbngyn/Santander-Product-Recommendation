@@ -4,19 +4,28 @@ import duckdb
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from src.features.model_panel import build_model_panel
+from src.features.persona import CATEGORICAL_PERSONA_FEATURES, PERSONA_FEATURES
+from src.pipeline.lightgbm_v2 import build_lightgbm_v2_panel
 
 
 def test_history_features_exclude_current_event_and_ignore_gapped_transition(tmp_path: Path) -> None:
     source = tmp_path / "checkpoints.parquet"
-    pq.write_table(pa.table({
+    data = {
         "ncodpers": [1, 1, 1, 1],
         "fecha_dato": ["2016-01-28", "2016-02-28", "2016-04-28", "2016-05-28"],
         "ind_a_ult1": pa.array([0, 1, 0, 1], type=pa.int8()),
         "ind_b_ult1": pa.array([1, 1, 0, 0], type=pa.int8()),
-    }), source)
+    }
+    for feature in PERSONA_FEATURES:
+        if feature in CATEGORICAL_PERSONA_FEATURES:
+            data[feature] = ["category"] * 4
+        else:
+            data[feature] = pa.array([1] * 4, type=pa.int8())
+    pq.write_table(pa.table(data), source)
 
-    panel = build_model_panel(source, tmp_path / "panel.parquet")
+    panel = build_lightgbm_v2_panel(source, tmp_path / "panel.parquet")
+    panel_columns = [row[0] for row in duckdb.connect().execute("DESCRIBE SELECT * FROM read_parquet(?)", [str(panel)]).fetchall()]
+    assert set(PERSONA_FEATURES).issubset(panel_columns)
     rows = duckdb.connect().execute(
         """SELECT fecha_dato, record_gap_months, customer_history_length,
                   products_owned_count, cumulative_acquisitions, cumulative_drops,

@@ -31,6 +31,8 @@ def train_product_classifiers(
     temp_directory: str | Path | None = None,
     lightgbm_params: Mapping[str, Any] | None = None,
     training_log_period: int = 5,
+    require_adjacent_month: bool = True,
+    categorical_feature_names: Sequence[str] | None = None,
 ) -> dict[str, str]:
     """Fit 24 independent classifiers using only customers unowned at t-1.
 
@@ -67,6 +69,10 @@ def train_product_classifiers(
         missing = set(selected).difference(columns)
         if missing:
             raise ValueError(f"Requested features missing from model panel: {sorted(missing)}")
+        categorical = list(categorical_feature_names or [])
+        invalid_categorical = set(categorical).difference(selected)
+        if invalid_categorical:
+            raise ValueError(f"Categorical features are absent from model inputs: {sorted(invalid_categorical)}")
         if training_log_period < 0:
             raise ValueError("training_log_period must be non-negative.")
         result: dict[str, str] = {}
@@ -76,7 +82,8 @@ def train_product_classifiers(
             # adjacent-month 0 -> {0,1} transition.  A gap cannot safely be
             # interpreted as a monthly non-acquisition.
             projection = ", ".join(_quote(c) for c in [*selected, "acq_" + product])
-            eligibility = f'record_gap_months = 1 AND COALESCE({_quote("prev_" + product)}, 0) = 0'
+            transition_filter = "record_gap_months = 1 AND " if require_adjacent_month else "previous_observation = 1 AND "
+            eligibility = f'{transition_filter}COALESCE({_quote("prev_" + product)}, 0) = 0'
             query = f'SELECT {projection} FROM read_parquet(?) WHERE {eligibility}'
             if max_rows_per_product:
                 query += f" LIMIT {int(max_rows_per_product)}"
@@ -124,6 +131,7 @@ def train_product_classifiers(
                 X, y,
                 eval_set=[(X, y)], eval_names=["training"],
                 eval_metric=["binary_logloss", "auc"], callbacks=callbacks,
+                categorical_feature=categorical,
             )
             duration_seconds = time.perf_counter() - model_started
             directory = root / product
