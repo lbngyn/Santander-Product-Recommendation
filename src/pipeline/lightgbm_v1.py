@@ -65,6 +65,7 @@ def run_lightgbm_v1(
             max_negative_rows_per_product=model.get("max_negative_rows_per_product"),
             max_total_rows_per_product=model.get("max_total_rows_per_product"),
             random_state=int(model.get("random_state", 42)),
+            negative_sampling_strategy=str(model.get("negative_sampling_strategy", "head")),
             n_estimators=int(model.get("n_estimators", 300)), n_jobs=int(runtime.get("threads", 1)),
             memory_limit=runtime.get("memory_limit"), temp_directory=runtime.get("temp_directory"),
             lightgbm_params=model.get("lightgbm_params"),

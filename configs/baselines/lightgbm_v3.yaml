@@ -29,6 +29,8 @@ model:
   version: lightgbm-binary-v3-persona-history
   n_estimators: 20
   random_state: 42
+  # Each model receives a deterministic, product-specific random negative set.
+  negative_sampling_strategy: random
   training_log_period: 5
   lightgbm_params:
     device_type: cpu

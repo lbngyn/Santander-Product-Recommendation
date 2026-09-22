@@ -30,6 +30,7 @@ def train_product_classifiers(
     max_negative_rows_per_product: int | None = None,
     max_total_rows_per_product: int | None = None,
     random_state: int = 42,
+    negative_sampling_strategy: str = "head",
     n_estimators: int = 300,
     n_jobs: int = 1,
     memory_limit: str | None = None,
@@ -42,8 +43,10 @@ def train_product_classifiers(
     """Fit 24 independent classifiers using only customers unowned at t-1.
 
     The panel must come from :func:`build_model_panel`; its current product
-    states are absent, while ``acq_*`` is a label.  Models are trained one at a
-    time, limiting peak memory to one product sample.
+    states are absent, while ``acq_*`` is a label. Models are trained one at a
+    time, limiting peak memory to one product sample. When negative examples
+    are capped, ``negative_sampling_strategy='random'`` orders them by a
+    deterministic DuckDB hash using ``random_state`` and the product ordinal.
     """
     try:
         import lightgbm as lgb
@@ -87,6 +90,8 @@ def train_product_classifiers(
             raise ValueError(f"Categorical features are absent from model inputs: {sorted(invalid_categorical)}")
         if training_log_period < 0:
             raise ValueError("training_log_period must be non-negative.")
+        if negative_sampling_strategy not in {"head", "random"}:
+            raise ValueError("negative_sampling_strategy must be either 'head' or 'random'.")
         result: dict[str, str] = {}
         training_started = time.perf_counter()
         if max_total_rows_per_product is not None and max_total_rows_per_product <= 0:
@@ -131,14 +136,20 @@ def train_product_classifiers(
                     if positive_count >= total_limit and total_limit > 1:
                         positive_limit = total_limit - 1
                         negative_limit = 1
-                # Keep every rare acquisition and cap only negatives. A plain
-                # LIMIT can discard all positives for low-incidence products.
+                # Keep every rare acquisition and cap only negatives. The
+                # random order is deterministic, so reruns with the same seed
+                # select the same rows without materialising all negatives.
+                negative_order = _negative_order_sql(
+                    negative_sampling_strategy,
+                    random_state=random_state,
+                    product_ordinal=model_number,
+                )
                 query = (
                     f'SELECT {projection} FROM (SELECT {projection} FROM read_parquet(?) '
                     f'WHERE {eligibility} AND {label} = 1 LIMIT {positive_limit}) '
                     f'UNION ALL '
                     f'SELECT {projection} FROM (SELECT {projection} FROM read_parquet(?) '
-                    f'WHERE {eligibility} AND {label} = 0 LIMIT {negative_limit})'
+                    f'WHERE {eligibility} AND {label} = 0{negative_order} LIMIT {negative_limit})'
                 )
             elif max_rows_per_product:
                 query += f" LIMIT {int(max_rows_per_product)}"
@@ -211,6 +222,8 @@ def train_product_classifiers(
             metrics.update({
                 "eligible_rows": len(y),
                 "acquisitions": positives,
+                "negative_sampling_strategy": negative_sampling_strategy,
+                "negative_sampling_seed": random_state + model_number if negative_sampling_strategy == "random" else None,
                 "duration_seconds": duration_seconds,
                 "rss_before_load_bytes": rss_before_load,
                 "rss_after_load_bytes": rss_after_load,
@@ -249,6 +262,16 @@ def train_product_classifiers(
 
 def _quote(value: str) -> str:
     return '"' + value.replace('"', '""') + '"'
+
+
+def _negative_order_sql(strategy: str, *, random_state: int, product_ordinal: int) -> str:
+    """Return a stable random ordering for one product's eligible negatives."""
+    if strategy == "head":
+        return ""
+    if strategy != "random":
+        raise ValueError("negative_sampling_strategy must be either 'head' or 'random'.")
+    sampling_seed = random_state + product_ordinal
+    return f" ORDER BY hash(ncodpers, fecha_dato, {sampling_seed}), ncodpers, fecha_dato"
 
 
 def _rss_bytes() -> int | None:
