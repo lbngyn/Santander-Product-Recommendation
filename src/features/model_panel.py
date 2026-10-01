@@ -6,9 +6,10 @@ from collections.abc import Sequence
 
 import duckdb
 
-from src.features.customer_history import acquisition_label_sql, product_event_count_sql, quote
+from src.features.customer_history import HISTORY_FEATURE_NAMES, acquisition_label_sql, product_event_count_sql, quote
+from src.features.contracts import exclude_eda_only_features
 from src.features.history_features import customer_history_length_window_sql, record_gap_months_sql
-from src.features.persona import PERSONA_FEATURES, persona_feature_projection_sql, raw_persona_projection_sql
+from src.features.persona import MODEL_PERSONA_FEATURES, PERSONA_FEATURES, persona_feature_projection_sql, raw_persona_projection_sql
 
 
 def build_model_panel(source_path: str | Path, destination_path: str | Path, *, history_feature_sql: Sequence[str], selected_rows_sql: str | None = None, selection_columns: Sequence[str] = (), force_process: bool = False, memory_limit: str | None = None, temp_directory: str | Path | None = None) -> Path:
@@ -40,7 +41,7 @@ def build_model_panel(source_path: str | Path, destination_path: str | Path, *, 
         products = [column for column in columns if column.endswith("_ult1")]
         if not products:
             raise ValueError("Source has no product columns ending in '_ult1'.")
-        profile_sql = ", ".join(quote(column) for column in PERSONA_FEATURES)
+        profile_sql = ", ".join(quote(column) for column in MODEL_PERSONA_FEATURES)
         raw_persona_sql = raw_persona_projection_sql("source", columns)
         persona_sql = persona_feature_projection_sql()
         product_sql = ", ".join(f"source.{quote(product)}" for product in products)
@@ -93,6 +94,85 @@ def build_model_panel(source_path: str | Path, destination_path: str | Path, *, 
                        recent_3m AS (PARTITION BY ncodpers ORDER BY CAST(fecha_dato AS DATE) RANGE BETWEEN INTERVAL 3 MONTH PRECEDING AND INTERVAL 1 DAY PRECEDING),
                        recent_6m AS (PARTITION BY ncodpers ORDER BY CAST(fecha_dato AS DATE) RANGE BETWEEN INTERVAL 6 MONTH PRECEDING AND INTERVAL 1 DAY PRECEDING)
             ) TO '{temporary_sql}' (FORMAT PARQUET, COMPRESSION ZSTD)
+        """)
+        temporary.replace(destination)
+        return destination
+    finally:
+        con.close()
+
+
+def build_model_panel_from_feature_store(
+    feature_store_path: str | Path,
+    destination_path: str | Path,
+    *,
+    selected_rows_sql: str | None = None,
+    selection_columns: Sequence[str] = (),
+    force_process: bool = False,
+    memory_limit: str | None = None,
+    temp_directory: str | Path | None = None,
+) -> Path:
+    """Create model-specific labels and sampling fields from reusable features.
+
+    The feature store contains only snapshot-time information.  This function
+    is the boundary where future month states become acquisition labels, so
+    labels and sample flags cannot accidentally be reused as model features.
+    """
+    source, destination = Path(feature_store_path), Path(destination_path)
+    if not source.is_file():
+        raise FileNotFoundError(f"Feature store checkpoint not found: {source}")
+    if destination.is_file() and not force_process:
+        return destination
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    con = duckdb.connect(database=":memory:")
+    try:
+        if memory_limit:
+            con.execute(f"SET memory_limit = '{str(memory_limit).replace(chr(39), chr(39) * 2)}'")
+        if temp_directory:
+            tmp = Path(temp_directory); tmp.mkdir(parents=True, exist_ok=True)
+            con.execute(f"SET temp_directory = '{str(tmp).replace(chr(39), chr(39) * 2)}'")
+        columns = [row[0] for row in con.execute("DESCRIBE SELECT * FROM read_parquet(?)", [str(source)]).fetchall()]
+        required = {"ncodpers", "fecha_dato", "record_gap_months", "rfm_has_previous_record", *PERSONA_FEATURES}
+        if missing := required.difference(columns):
+            raise ValueError(f"Feature store is missing required columns: {sorted(missing)}")
+        products = [
+            column for column in columns
+            if column.endswith("_ult1")
+            and not column.startswith(("prev_", "acq_"))
+        ]
+        if not products:
+            raise ValueError("Feature store has no product columns ending in '_ult1'.")
+        previous = ["prev_" + product for product in products]
+        if missing := set(previous).difference(columns):
+            raise ValueError(f"Feature store is missing previous product states: {sorted(missing)}")
+        # Canonical ``acq_*`` fields are EDA-only.  Keep this explicit even
+        # though the current whitelist also excludes them, so new model-panel
+        # feature groups cannot accidentally leak them into training.
+        feature_columns = exclude_eda_only_features(
+            name for name in columns if name in MODEL_PERSONA_FEATURES or name in HISTORY_FEATURE_NAMES
+        )
+        labels = ", ".join(
+            f"CAST(CASE WHEN record_gap_months = 1 AND COALESCE({quote('prev_' + product)}, 0) = 0 "
+            f"AND COALESCE({quote(product)}, 0) = 1 THEN 1 ELSE 0 END AS TINYINT) AS {quote('acq_' + product)}"
+            for product in products
+        )
+        selection_projection = ", ".join(f"selection.{quote(name)}" for name in selection_columns)
+        source_sql = str(source).replace("'", "''")
+        selection_cte = ""
+        final_join = ""
+        if selected_rows_sql:
+            selection_cte = f"selection AS ({selected_rows_sql.replace('{source_path}', source_sql)}),"
+            final_join = "INNER JOIN selection USING (ncodpers, fecha_dato)"
+        temporary = destination.with_suffix(destination.suffix + ".tmp")
+        if temporary.exists():
+            temporary.unlink()
+        con.execute(f"""
+            COPY (
+                WITH {selection_cte} features AS (SELECT * FROM read_parquet('{source_sql}'))
+                SELECT ncodpers, fecha_dato, {', '.join(quote(name) for name in feature_columns)},
+                       {', '.join(quote(name) for name in previous)}, {labels}
+                       {', ' if selection_projection else ''}{selection_projection}
+                FROM features {final_join}
+            ) TO '{str(temporary).replace(chr(39), chr(39) * 2)}' (FORMAT PARQUET, COMPRESSION ZSTD)
         """)
         temporary.replace(destination)
         return destination

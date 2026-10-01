@@ -5,7 +5,7 @@ from pathlib import Path
 
 import duckdb
 
-from src.features.persona import PERSONA_FEATURES, persona_feature_projection_sql, raw_persona_projection_sql
+from src.features.persona import MODEL_PERSONA_FEATURES, persona_feature_projection_sql, raw_persona_projection_sql
 
 
 def build_model_panel_v1(source_path: str | Path, destination_path: str | Path, *, force_process: bool = False, memory_limit: str | None = None, temp_directory: str | Path | None = None) -> Path:
@@ -31,12 +31,13 @@ def build_model_panel_v1(source_path: str | Path, destination_path: str | Path, 
         if not products:
             raise ValueError("Source has no product columns ending in '_ult1'.")
         q = lambda value: '"' + value.replace('"', '""') + '"'
-        profile_sql = ", ".join(q(column) for column in PERSONA_FEATURES)
+        profile_sql = ", ".join(q(column) for column in MODEL_PERSONA_FEATURES)
         raw_persona_sql = raw_persona_projection_sql("source", columns)
         persona_sql = persona_feature_projection_sql()
         previous_sql = ", ".join(f"CAST(COALESCE(LAG({q(product)}) OVER customer_time, 0) AS TINYINT) AS {q('prev_' + product)}" for product in products)
+        record_gap_sql = "CAST(date_diff('month', LAG(CAST(fecha_dato AS DATE)) OVER customer_time, CAST(fecha_dato AS DATE)) AS INTEGER)"
         label_sql = ", ".join(
-            f"CAST(CASE WHEN LAG(fecha_dato) OVER customer_time IS NOT NULL AND COALESCE(LAG({q(product)}) OVER customer_time, 0) = 0 AND COALESCE({q(product)}, 0) = 1 THEN 1 ELSE 0 END AS TINYINT) AS {q('acq_' + product)}"
+            f"CAST(CASE WHEN {record_gap_sql} = 1 AND COALESCE(LAG({q(product)}) OVER customer_time, 0) = 0 AND COALESCE({q(product)}, 0) = 1 THEN 1 ELSE 0 END AS TINYINT) AS {q('acq_' + product)}"
             for product in products
         )
         temporary = destination.with_suffix(destination.suffix + ".tmp")
@@ -50,6 +51,7 @@ def build_model_panel_v1(source_path: str | Path, destination_path: str | Path, 
                     FROM read_parquet('{str(source).replace("'", "''")}') AS source
                 )
                 SELECT ncodpers, fecha_dato{', ' if profile_sql else ''}{profile_sql},
+                       {record_gap_sql} AS record_gap_months,
                        CAST(LAG(fecha_dato) OVER customer_time IS NOT NULL AS TINYINT) AS previous_observation,
                        {previous_sql}, {label_sql}
                 FROM source_rows

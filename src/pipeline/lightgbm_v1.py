@@ -34,7 +34,7 @@ def run_lightgbm_v1(
     *,
     resolved_config_path: str | Path,
     panel_builder: Any = build_model_panel_v1,
-    require_adjacent_month: bool = False,
+    require_adjacent_month: bool = True,
     categorical_feature_names: list[str] | None = None,
 ) -> dict[str, Any]:
     """Build the leakage-safe panel, train 24 artifacts, then write lineage."""

@@ -11,15 +11,27 @@ from collections.abc import Sequence
 
 HISTORY_FEATURE_NAMES: tuple[str, ...] = (
     "record_gap_months",
+    "rfm_has_previous_record",
+    "rfm_recency_months",
+    "rfm_never_acquired_before",
+    "rfm_frequency",
+    "rfm_monetary",
+    "rfm_observed_history_records",
+    "acquisitions_last_1m",
+    "acquisitions_last_3m",
+    "acquisitions_last_6m",
+    "cumulative_drops",
+)
+
+# Superseded fields are retained only to evict stale columns owned by the
+# history checkpoint during this schema migration.
+LEGACY_HISTORY_FEATURE_NAMES: tuple[str, ...] = (
+    "previous_observation",
     "customer_history_length",
     "products_owned_count",
     "cumulative_acquisitions",
     "months_since_last_acquisition",
     "never_acquired_before",
-    "acquisitions_last_1m",
-    "acquisitions_last_3m",
-    "acquisitions_last_6m",
-    "cumulative_drops",
 )
 
 

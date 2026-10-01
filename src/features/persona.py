@@ -18,14 +18,24 @@ RAW_PERSONA_COLUMNS: tuple[str, ...] = (
 # These are the only persona columns emitted into a model panel.
 PERSONA_FEATURES: tuple[str, ...] = (
     "time_idx", "snapshot_month", "account_age_months", "age", "income_log",
-    "is_new_customer", "customer_relationship_status", "is_active_customer",
+    "is_new_customer", "relationship_indrel", "relationship_indrel_1mes",
+    "relationship_tiprel_1mes", "relationship_last_transaction_date", "is_active_customer",
     "employee_status", "is_male", "is_deceased", "country", "province",
     "is_domestic", "entry_channel", "customer_segment",
     "profile_missing_structural",
 )
 CATEGORICAL_PERSONA_FEATURES: tuple[str, ...] = (
-    "snapshot_month", "customer_relationship_status", "employee_status", "country",
+    "snapshot_month", "relationship_indrel", "relationship_indrel_1mes",
+    "relationship_tiprel_1mes", "employee_status", "country",
     "province", "entry_channel", "customer_segment",
+)
+# These fields remain in the feature store as inputs for downstream feature
+# engineering, but are not direct classifier inputs until transformed.
+NON_MODEL_PERSONA_FEATURES: tuple[str, ...] = (
+    "relationship_last_transaction_date",
+)
+MODEL_PERSONA_FEATURES: tuple[str, ...] = tuple(
+    name for name in PERSONA_FEATURES if name not in NON_MODEL_PERSONA_FEATURES
 )
 
 
@@ -70,10 +80,6 @@ def persona_feature_projection_sql(*, features: Sequence[str] = PERSONA_FEATURES
     age = f"TRY_CAST({raw('age')} AS DOUBLE)"
     income = f"CASE WHEN TRY_CAST({raw('renta')} AS DOUBLE) >= 0 THEN TRY_CAST({raw('renta')} AS DOUBLE) END"
     opening_date = f"TRY_CAST({raw('fecha_alta')} AS DATE)"
-    relationship = (
-        f"COALESCE(REPLACE({text('indrel_1mes')}, '.0', ''), {text('tiprel_1mes')}, "
-        f"REPLACE({text('indrel')}, '.0', ''), CASE WHEN {raw('ult_fec_cli_1t')} IS NOT NULL THEN '99' END)"
-    )
     structural = ("age", "antiguedad", "ind_nuevo", "indrel", "ind_actividad_cliente",
                   "ind_empleado", "indfall", "pais_residencia", "fecha_alta", "tipodom", "indresi", "indext")
     values: dict[str, str] = {
@@ -83,7 +89,10 @@ def persona_feature_projection_sql(*, features: Sequence[str] = PERSONA_FEATURES
         "age": f"CAST({stable(age)} AS DOUBLE)",
         "income_log": f"LN(1 + {stable(income)})",
         "is_new_customer": f"CAST(CASE {text('ind_nuevo')} WHEN '1' THEN 1 WHEN '0' THEN 0 END AS TINYINT)",
-        "customer_relationship_status": relationship,
+        "relationship_indrel": f"REPLACE({text('indrel')}, '.0', '')",
+        "relationship_indrel_1mes": f"REPLACE({text('indrel_1mes')}, '.0', '')",
+        "relationship_tiprel_1mes": text("tiprel_1mes"),
+        "relationship_last_transaction_date": f"TRY_CAST({raw('ult_fec_cli_1t')} AS DATE)",
         "is_active_customer": f"CAST(CASE {text('ind_actividad_cliente')} WHEN '1' THEN 1 WHEN '0' THEN 0 END AS TINYINT)",
         "employee_status": stable(text("ind_empleado")),
         "is_male": f"CAST(CASE {stable(text('sexo'))} WHEN 'H' THEN 1 WHEN 'V' THEN 0 END AS TINYINT)",

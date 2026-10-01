@@ -12,19 +12,8 @@ from typing import Any, Mapping
 
 import yaml
 
-from src.features.history_features import (
-    acquisitions_last_1m_sql,
-    acquisitions_last_3m_sql,
-    acquisitions_last_6m_sql,
-    cumulative_acquisitions_sql,
-    cumulative_drops_sql,
-    customer_history_length_sql,
-    months_since_last_acquisition_sql,
-    never_acquired_before_sql,
-    products_owned_count_sql,
-    record_gap_months_sql,
-)
-from src.features.model_panel import build_model_panel
+from src.features.feature_store import ensure_customer_month_feature_store
+from src.features.model_panel import build_model_panel_from_feature_store
 from src.features.persona import CATEGORICAL_PERSONA_FEATURES, PERSONA_FEATURES
 from src.pipeline.lightgbm_v1 import (
     run_lightgbm_v1,
@@ -43,10 +32,15 @@ def run_lightgbm_v3_from_config(config_path: str | Path = "configs/baselines/lig
 
 def run_lightgbm_v3(config: Mapping[str, Any], *, resolved_config_path: str | Path) -> dict[str, Any]:
     """Build the v3 persona/history panel and train valid monthly transitions."""
+    declared_feature_store = config.get("data", {}).get("feature_store")
+
+    def panel_builder(source: str | Path, destination: str | Path, **kwargs: Any) -> Path:
+        return build_lightgbm_v3_panel(source, destination, feature_store_path=declared_feature_store, **kwargs)
+
     return run_lightgbm_v1(
         config,
         resolved_config_path=resolved_config_path,
-        panel_builder=build_lightgbm_v3_panel,
+        panel_builder=panel_builder,
         require_adjacent_month=True,
         categorical_feature_names=list(CATEGORICAL_PERSONA_FEATURES),
     )
@@ -55,26 +49,31 @@ def run_lightgbm_v3(config: Mapping[str, Any], *, resolved_config_path: str | Pa
 def build_lightgbm_v3_panel(source_path: str | Path, destination_path: str | Path, **kwargs: Any) -> Path:
     """Materialise one panel with canonical persona and past-only history features.
 
-    ``build_model_panel`` owns the feature join: it projects every value in
-    :data:`PERSONA_FEATURES` for the current snapshot and evaluates the SQL
-    expressions below over windows ending at the preceding customer record.
+    Persona and history are first read from the common customer-month feature
+    store.  This function owns only V3's model-specific selection flags.
     """
-    products = _product_columns(source_path)
+    source, destination = Path(source_path), Path(destination_path)
     selection_config = kwargs.pop("selection_config", None)
-    history_features = [
-        record_gap_months_sql(output=True),
-        customer_history_length_sql(),
-        products_owned_count_sql(products),
-        cumulative_acquisitions_sql(),
-        months_since_last_acquisition_sql(),
-        never_acquired_before_sql(),
-        acquisitions_last_1m_sql(),
-        acquisitions_last_3m_sql(),
-        acquisitions_last_6m_sql(),
-        cumulative_drops_sql(),
-    ]
+    declared_feature_store = kwargs.pop("feature_store_path", None)
+    force_process = bool(kwargs.pop("force_process", False))
+    memory_limit = kwargs.pop("memory_limit", None)
+    temp_directory = kwargs.pop("temp_directory", None)
+    if kwargs:
+        raise TypeError(f"Unexpected V3 panel arguments: {sorted(kwargs)}")
+    feature_store = Path(declared_feature_store) if declared_feature_store else _feature_store_path(source, destination)
+    if declared_feature_store and not feature_store.is_absolute():
+        feature_store = source.parent.parent / feature_store
+    ensure_customer_month_feature_store(
+        source, feature_store, force_process=force_process,
+        memory_limit=memory_limit, temp_directory=temp_directory,
+    )
+    products = _product_columns(feature_store)
     selected_rows_sql, selection_columns = _selected_rows_sql(products, selection_config) if selection_config else (None, ())
-    return build_model_panel(source_path, destination_path, history_feature_sql=history_features, selected_rows_sql=selected_rows_sql, selection_columns=selection_columns, **kwargs)
+    return build_model_panel_from_feature_store(
+        feature_store, destination, selected_rows_sql=selected_rows_sql,
+        selection_columns=selection_columns, force_process=force_process,
+        memory_limit=memory_limit, temp_directory=temp_directory,
+    )
 
 
 def _selected_rows_sql(products: list[str], config: Mapping[str, Any]) -> tuple[str, tuple[str, ...]]:
@@ -82,21 +81,18 @@ def _selected_rows_sql(products: list[str], config: Mapping[str, Any]) -> tuple[
     validation_date = str(config["validation_date"]).replace("'", "''")
     negative_limit = int(config["max_negative_rows_per_product"])
     seed = int(config["random_state"])
-    values = ", ".join(f"('{product}', COALESCE(TRY_CAST(\"{product}\" AS TINYINT), 0), COALESCE(TRY_CAST(\"previous_{product}\" AS TINYINT), 0), {index})" for index, product in enumerate(products, start=1))
+    values = ", ".join(f"('{product}', COALESCE(TRY_CAST(\"{product}\" AS TINYINT), 0), COALESCE(TRY_CAST(\"prev_{product}\" AS TINYINT), 0), {index})" for index, product in enumerate(products, start=1))
     flags = tuple("sampled_for_" + product for product in products)
     flag_sql = ", ".join(f"CAST(MAX(CASE WHEN product = '{product}' AND is_negative = 1 THEN 1 ELSE 0 END) AS TINYINT) AS \"sampled_for_{product}\"" for product in products)
     sql = f"""
-        WITH ordered AS (
-            SELECT ncodpers, fecha_dato, LAG(fecha_dato) OVER customer_time AS previous_date,
-                   {', '.join(f'\"{product}\", LAG(\"{product}\") OVER customer_time AS \"previous_{product}\"' for product in products)}
-            FROM read_parquet('{{source_path}}')
-            WINDOW customer_time AS (PARTITION BY ncodpers ORDER BY fecha_dato)
+        WITH source_rows AS (
+            SELECT * FROM read_parquet('{{source_path}}')
         ), candidate_events AS (
             SELECT ncodpers, fecha_dato, product,
                    CAST(current_value = 1 AND previous_value = 0 AS TINYINT) AS label,
                    product_ordinal
-            FROM ordered CROSS JOIN LATERAL (VALUES {values}) AS v(product, current_value, previous_value, product_ordinal)
-            WHERE date_diff('month', CAST(previous_date AS DATE), CAST(fecha_dato AS DATE)) = 1
+            FROM source_rows CROSS JOIN LATERAL (VALUES {values}) AS v(product, current_value, previous_value, product_ordinal)
+            WHERE record_gap_months = 1
               AND previous_value = 0 AND CAST(fecha_dato AS DATE) < CAST('{validation_date}' AS DATE)
         ), sampled AS (
             SELECT *, CASE WHEN label = 0 AND ROW_NUMBER() OVER (PARTITION BY product ORDER BY hash(ncodpers, fecha_dato, {seed} + product_ordinal), ncodpers, fecha_dato) <= {negative_limit} THEN 1 ELSE 0 END AS is_negative
@@ -105,7 +101,7 @@ def _selected_rows_sql(products: list[str], config: Mapping[str, Any]) -> tuple[
             SELECT ncodpers, fecha_dato, product, is_negative FROM sampled WHERE label = 1 OR is_negative = 1
         ), validation_keys AS (
             SELECT ncodpers, fecha_dato, NULL::VARCHAR AS product, 0 AS is_negative
-            FROM ordered WHERE date_diff('month', CAST(previous_date AS DATE), CAST(fecha_dato AS DATE)) = 1 AND CAST(fecha_dato AS DATE) = CAST('{validation_date}' AS DATE)
+            FROM source_rows WHERE record_gap_months = 1 AND CAST(fecha_dato AS DATE) = CAST('{validation_date}' AS DATE)
         )
         SELECT ncodpers, fecha_dato, {flag_sql}
         FROM (SELECT * FROM selected_train UNION ALL SELECT * FROM validation_keys)
@@ -123,10 +119,16 @@ def _product_columns(source_path: str | Path) -> list[str]:
         return [
             row[0]
             for row in con.execute("DESCRIBE SELECT * FROM read_parquet(?)", [str(source_path)]).fetchall()
-            if row[0].endswith("_ult1")
+            if row[0].endswith("_ult1") and not row[0].startswith(("prev_", "acq_"))
         ]
     finally:
         con.close()
+
+
+def _feature_store_path(source: Path, destination: Path) -> Path:
+    if source.parent.name == "interim":
+        return source.parent.parent / "processed" / "customer_month_features.parquet"
+    return destination.parent / "customer_month_features.parquet"
 
 
 def run_lightgbm_v3_competition_from_config(

@@ -11,20 +11,9 @@ from typing import Any, Mapping
 
 import yaml
 
-from src.features.model_panel import build_model_panel
+from src.features.feature_store import ensure_customer_month_feature_store
+from src.features.model_panel import build_model_panel_from_feature_store
 from src.features.persona import CATEGORICAL_PERSONA_FEATURES
-from src.features.history_features import (
-    acquisitions_last_1m_sql,
-    acquisitions_last_3m_sql,
-    acquisitions_last_6m_sql,
-    cumulative_acquisitions_sql,
-    cumulative_drops_sql,
-    customer_history_length_sql,
-    months_since_last_acquisition_sql,
-    never_acquired_before_sql,
-    products_owned_count_sql,
-    record_gap_months_sql,
-)
 from src.pipeline.lightgbm_v1 import (
     run_lightgbm_v1,
     run_lightgbm_v1_competition_from_config,
@@ -42,42 +31,47 @@ def run_lightgbm_v2_from_config(config_path: str | Path = "configs/baselines/lig
 
 def run_lightgbm_v2(config: Mapping[str, Any], *, resolved_config_path: str | Path) -> dict[str, Any]:
     """Build the v2 feature panel and train on valid adjacent-month events."""
+    declared_feature_store = config.get("data", {}).get("feature_store")
+
+    def panel_builder(source: str | Path, destination: str | Path, **kwargs: Any) -> Path:
+        return build_lightgbm_v2_panel(source, destination, feature_store_path=declared_feature_store, **kwargs)
+
     return run_lightgbm_v1(
         config,
         resolved_config_path=resolved_config_path,
-        panel_builder=build_lightgbm_v2_panel,
+        panel_builder=panel_builder,
         require_adjacent_month=True,
         categorical_feature_names=list(CATEGORICAL_PERSONA_FEATURES),
     )
 
 
 def build_lightgbm_v2_panel(source_path: str | Path, destination_path: str | Path, **kwargs: Any) -> Path:
-    """Compose v2's individual feature builders, then materialize one panel."""
-    products = _product_columns(source_path)
-    history_features = [
-        record_gap_months_sql(output=True),
-        customer_history_length_sql(),
-        products_owned_count_sql(products),
-        cumulative_acquisitions_sql(),
-        months_since_last_acquisition_sql(),
-        never_acquired_before_sql(),
-        acquisitions_last_1m_sql(),
-        acquisitions_last_3m_sql(),
-        acquisitions_last_6m_sql(),
-        cumulative_drops_sql(),
-    ]
-    return build_model_panel(source_path, destination_path, history_feature_sql=history_features, **kwargs)
+    """Use shared persona/history checkpoints, then create V2 labels only."""
+    declared_feature_store = kwargs.pop("feature_store_path", None)
+    force_process = bool(kwargs.pop("force_process", False))
+    memory_limit = kwargs.pop("memory_limit", None)
+    temp_directory = kwargs.pop("temp_directory", None)
+    if kwargs:
+        raise TypeError(f"Unexpected V2 panel arguments: {sorted(kwargs)}")
+    source, destination = Path(source_path), Path(destination_path)
+    feature_store = Path(declared_feature_store) if declared_feature_store else _feature_store_path(source, destination)
+    if declared_feature_store and not feature_store.is_absolute():
+        feature_store = source.parent.parent / feature_store
+    ensure_customer_month_feature_store(
+        source, feature_store, force_process=force_process,
+        memory_limit=memory_limit, temp_directory=temp_directory,
+    )
+    return build_model_panel_from_feature_store(
+        feature_store, destination, force_process=force_process,
+        memory_limit=memory_limit, temp_directory=temp_directory,
+    )
 
 
-def _product_columns(source_path: str | Path) -> list[str]:
-    """Read only the source schema to wire product-dependent feature builders."""
-    import duckdb
-
-    con = duckdb.connect(database=":memory:")
-    try:
-        return [row[0] for row in con.execute("DESCRIBE SELECT * FROM read_parquet(?)", [str(source_path)]).fetchall() if row[0].endswith("_ult1")]
-    finally:
-        con.close()
+def _feature_store_path(source: Path, destination: Path) -> Path:
+    """Keep one shared processed checkpoint per data root, including in tests."""
+    if source.parent.name == "interim":
+        return source.parent.parent / "processed" / "customer_month_features.parquet"
+    return destination.parent / "customer_month_features.parquet"
 
 
 def run_lightgbm_v2_competition_from_config(model_index_path: str | Path, config_path: str | Path | None = None) -> Path:
