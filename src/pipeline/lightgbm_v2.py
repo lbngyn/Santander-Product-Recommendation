@@ -1,7 +1,7 @@
 """History-feature v2 of the 24 independent LightGBM pipeline.
 
 Pipeline v1 remains an immutable baseline.  This module selects the v2 panel
-and adjacent-month transition semantics while reusing the shared orchestration
+and nearest-observed-record transition semantics while reusing the shared orchestration
 and submission contract.
 """
 from __future__ import annotations
@@ -30,7 +30,7 @@ def run_lightgbm_v2_from_config(config_path: str | Path = "configs/baselines/lig
 
 
 def run_lightgbm_v2(config: Mapping[str, Any], *, resolved_config_path: str | Path) -> dict[str, Any]:
-    """Build the v2 feature panel and train on valid adjacent-month events."""
+    """Build the v2 feature panel and train on nearest-record acquisition events."""
     declared_feature_store = config.get("data", {}).get("feature_store")
 
     def panel_builder(source: str | Path, destination: str | Path, **kwargs: Any) -> Path:
@@ -40,7 +40,7 @@ def run_lightgbm_v2(config: Mapping[str, Any], *, resolved_config_path: str | Pa
         config,
         resolved_config_path=resolved_config_path,
         panel_builder=panel_builder,
-        require_adjacent_month=True,
+        require_adjacent_month=False,
         categorical_feature_names=list(CATEGORICAL_PERSONA_FEATURES),
     )
 

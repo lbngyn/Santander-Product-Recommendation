@@ -1,7 +1,7 @@
 """Persona-and-history LightGBM acquisition pipeline, version 3.
 
 Version 3 is an independently reproducible experiment that keeps the v2
-acquisition target and adjacent-month semantics, while making the feature
+acquisition target and nearest-observed-record semantics, while making the feature
 contract explicit: canonical persona features at snapshot ``t`` are combined
 with history-only portfolio and event features available strictly before ``t``.
 """
@@ -31,7 +31,7 @@ def run_lightgbm_v3_from_config(config_path: str | Path = "configs/baselines/lig
 
 
 def run_lightgbm_v3(config: Mapping[str, Any], *, resolved_config_path: str | Path) -> dict[str, Any]:
-    """Build the v3 persona/history panel and train valid monthly transitions."""
+    """Build the v3 persona/history panel and train nearest-record transitions."""
     declared_feature_store = config.get("data", {}).get("feature_store")
 
     def panel_builder(source: str | Path, destination: str | Path, **kwargs: Any) -> Path:
@@ -41,7 +41,7 @@ def run_lightgbm_v3(config: Mapping[str, Any], *, resolved_config_path: str | Pa
         config,
         resolved_config_path=resolved_config_path,
         panel_builder=panel_builder,
-        require_adjacent_month=True,
+        require_adjacent_month=False,
         categorical_feature_names=list(CATEGORICAL_PERSONA_FEATURES),
     )
 
@@ -92,7 +92,7 @@ def _selected_rows_sql(products: list[str], config: Mapping[str, Any]) -> tuple[
                    CAST(current_value = 1 AND previous_value = 0 AS TINYINT) AS label,
                    product_ordinal
             FROM source_rows CROSS JOIN LATERAL (VALUES {values}) AS v(product, current_value, previous_value, product_ordinal)
-            WHERE record_gap_months = 1
+            WHERE rfm_has_previous_record = 1
               AND previous_value = 0 AND CAST(fecha_dato AS DATE) < CAST('{validation_date}' AS DATE)
         ), sampled AS (
             SELECT *, CASE WHEN label = 0 AND ROW_NUMBER() OVER (PARTITION BY product ORDER BY hash(ncodpers, fecha_dato, {seed} + product_ordinal), ncodpers, fecha_dato) <= {negative_limit} THEN 1 ELSE 0 END AS is_negative
@@ -101,7 +101,7 @@ def _selected_rows_sql(products: list[str], config: Mapping[str, Any]) -> tuple[
             SELECT ncodpers, fecha_dato, product, is_negative FROM sampled WHERE label = 1 OR is_negative = 1
         ), validation_keys AS (
             SELECT ncodpers, fecha_dato, NULL::VARCHAR AS product, 0 AS is_negative
-            FROM source_rows WHERE record_gap_months = 1 AND CAST(fecha_dato AS DATE) = CAST('{validation_date}' AS DATE)
+            FROM source_rows WHERE rfm_has_previous_record = 1 AND CAST(fecha_dato AS DATE) = CAST('{validation_date}' AS DATE)
         )
         SELECT ncodpers, fecha_dato, {flag_sql}
         FROM (SELECT * FROM selected_train UNION ALL SELECT * FROM validation_keys)

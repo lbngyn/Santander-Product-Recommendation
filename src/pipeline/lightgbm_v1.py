@@ -34,7 +34,7 @@ def run_lightgbm_v1(
     *,
     resolved_config_path: str | Path,
     panel_builder: Any = build_model_panel_v1,
-    require_adjacent_month: bool = True,
+    require_adjacent_month: bool = False,
     categorical_feature_names: list[str] | None = None,
 ) -> dict[str, Any]:
     """Build the leakage-safe panel, train 24 artifacts, then write lineage."""
@@ -89,6 +89,7 @@ def run_lightgbm_v1(
             panel_path, models, artifacts,
             validation_date=str(split["validation_date"]),
             top_k=int(config.get("competition", {}).get("top_k", 7)),
+            require_adjacent_month=require_adjacent_month,
         )
     resolved_copy = artifacts / "config_resolved.yaml"
     resolved_copy.write_text(yaml.safe_dump(dict(config), sort_keys=False), encoding="utf-8")

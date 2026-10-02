@@ -16,13 +16,14 @@ import duckdb
 
 from src.data.gcs_storage import download_object_if_missing, object_name
 from src.features.checkpoint_store import (
-    KEY_COLUMNS, CheckpointStore, ProcessingStep, run_processing_pipeline,
+    KEY_COLUMNS, CheckpointStore, ProcessingStep, plan_processing_pipeline, resolve_forced_steps, run_processing_pipeline,
 )
 from src.features.customer_history import HISTORY_FEATURE_NAMES, quote
-from src.features.feature_store import acquisition_feature_names, ensure_customer_month_feature_store
+from src.features.feature_store import acquisition_feature_names, materialize_customer_month_feature_group
 from src.features.persona import PERSONA_FEATURES, RAW_PERSONA_COLUMNS
 from src.ingestion.checkpoint import build_interim_checkpoint
 from src.preprocessing.customer_profile import preprocess_customer_profile_baseline
+from src.preprocessing.renta_monetary import RENTA_OUTPUTS, preprocess_renta_monetary
 from src.products import PRODUCT_COLUMNS
 
 
@@ -34,12 +35,48 @@ ENGINEERED_FEATURES = tuple(dict.fromkeys((
     *acquisition_feature_names(PRODUCT_COLUMNS),
 )))
 
+# Public notebook/config catalog: each name owns precisely these outputs.
+# Age is both cleaned by profile preprocessing and projected by persona logic;
+# selecting that shared output forces both producers. Renta has one owner.
+PIPELINE_FUNCTION_OUTPUTS: dict[str, tuple[str, ...]] = {
+    "customer_profile_preprocessing": (*tuple(c for c in PROFILE_COLUMNS if c != "renta"), PREPROCESSING_MARKER),
+    "renta_monetary_preprocessing": (*RENTA_OUTPUTS, "renta"),
+    "persona_features": PERSONA_FEATURES,
+    "previous_product_states": tuple("prev_" + name for name in PRODUCT_COLUMNS),
+    "acquisition_features": acquisition_feature_names(PRODUCT_COLUMNS),
+    "record_gap_months_sql": ("record_gap_months",),
+    "rfm_has_previous_record": ("rfm_has_previous_record",),
+    "rfm_recency_months_sql": ("rfm_recency_months",),
+    "rfm_never_acquired_before_sql": ("rfm_never_acquired_before",),
+    "rfm_frequency_sql": ("rfm_frequency",),
+    "rfm_monetary_sql": ("rfm_monetary",),
+    "rfm_history_coverage_sql": ("rfm_observed_history_records",),
+    "acquisitions_last_1m_sql": ("acquisitions_last_1m",),
+    "acquisitions_last_3m_sql": ("acquisitions_last_3m",),
+    "acquisitions_last_6m_sql": ("acquisitions_last_6m",),
+    "cumulative_drops_sql": ("cumulative_drops",),
+}
+
+# Actual persisted inputs: history functions currently compute their shared
+# intermediates directly from product states, not from stored prev_/acq_ outputs.
+PIPELINE_FUNCTION_INPUTS = {
+    name: (*KEY_COLUMNS, *(RAW_PERSONA_COLUMNS if name == "persona_features" else PRODUCT_COLUMNS))
+    for name in PIPELINE_FUNCTION_OUTPUTS
+}
+PIPELINE_FUNCTION_INPUTS.update({
+    "customer_profile_preprocessing": (*KEY_COLUMNS, "age", "antiguedad", "renta"),
+    "renta_monetary_preprocessing": (*KEY_COLUMNS, "renta", "cod_prov", "pais_residencia"),
+})
+
 
 def run_data_pipeline(
     *,
     required_features: Sequence[str] = (),
     force_process: bool = False,
+    force_features: Sequence[str] = (),
+    force_functions: Sequence[str] = (),
     publish_checkpoint: bool = True,
+    dry_run: bool = False,
     data_root: str | Path | None = None,
     checkpoint_root: str | Path | None = None,
     work_root: str | Path | None = None,
@@ -54,20 +91,56 @@ def run_data_pipeline(
     """Resolve a retained snapshot or compute and optionally publish a candidate.
 
     Empty requirements reuse the latest valid snapshot. ``force_process``
-    bypasses reuse and recomputes on new files. Cleanup remains an explicit
+    bypasses reuse and recomputes on new files. Explicit feature/function
+    selections bypass reuse and force their owners plus downstream consumers
+    of updated inputs. Features outside executed contracts are retained;
+    missing-output functions still run. ``dry_run`` previews without writes.
+    Cleanup remains an explicit
     infrastructure operation; this entrypoint never deletes retained versions.
     """
+    forced_steps = resolve_forced_steps(
+        PIPELINE_FUNCTION_OUTPUTS, force_features=force_features, force_functions=force_functions,
+    )
     root = Path(data_root or os.getenv("SANTANDER_DATA_ROOT", "data"))
     store = CheckpointStore(checkpoint_root or root / "processed/canonical_customer_month")
     required = tuple(dict.fromkeys(required_features))
     resolved = store.resolve(required, required_artifacts=("train",))
-    if resolved is not None and not force_process:
+    if resolved is not None and not force_process and not forced_steps and not dry_run:
         path = store.root / resolved["artifacts"]["train"]["path"]
         print(f"[checkpoint] REUSE version={resolved['version']} | final validation=PASS")
         return {"status": "reused", "customer_month": path, "version": resolved,
                 "processing": [], "published": False}
 
     parent = resolved or store.resolve([], required_artifacts=("train",))
+    if dry_run:
+        source = store.root / parent["artifacts"]["train"]["path"] if parent else root / "interim/train.parquet"
+        columns = set()
+        if source.is_file():
+            with duckdb.connect() as con:
+                columns = {r[0] for r in con.execute("DESCRIBE SELECT * FROM read_parquet(?)", [str(source)]).fetchall()}
+        preview_steps = [ProcessingStep(
+            name,
+            tuple(c for c in outputs if name != "customer_profile_preprocessing" or not columns
+                  or c in columns or c == PREPROCESSING_MARKER),
+            PIPELINE_FUNCTION_INPUTS[name], lambda current: current,
+        ) for name, outputs in PIPELINE_FUNCTION_OUTPUTS.items()]
+        processing = plan_processing_pipeline(preview_steps, columns, force_process=force_process,
+                                              force_features=force_features, force_functions=force_functions)
+        will_reuse = resolved is not None and not force_process and not forced_steps
+        if will_reuse:
+            # Match the resolver's minimum-schema reuse path exactly, even if
+            # the retained snapshot does not contain every optional feature.
+            for summary in processing:
+                summary.update(decision="SKIP", force_process=False, upstream_functions=[],
+                               reasons=["checkpoint_reuse"])
+        for summary in processing:
+            print(json_summary(summary))
+        predicted = columns | {c for s in processing for c in s["declared_outputs"] if s["decision"] == "RUN"}
+        return {"status": "planned", "customer_month": source if source.is_file() else None,
+                "version": parent, "processing": processing, "published": False,
+                "will_reuse": will_reuse,
+                "needs_ingestion": parent is None,
+                "unsatisfied_required_features": sorted(set(required) - predicted)}
     work = Path(work_root or root / ".pipeline_work")
     work.mkdir(parents=True, exist_ok=True)
     # Unique run directories also prevent accidental reuse of stale sidecars.
@@ -165,7 +238,7 @@ def run_data_pipeline(
         return interim
 
     working = {"train": store.root / parent["artifacts"]["train"]["path"]} if parent else {"train": ingest()}
-    profile_outputs = tuple(name for name in PROFILE_COLUMNS if name in schema(working["train"]))
+    profile_outputs = tuple(name for name in PROFILE_COLUMNS if name != "renta" and name in schema(working["train"]))
 
     def preprocess(current: dict[str, Path]) -> dict[str, Path]:
         print("[processing] RUN customer_profile_preprocessing")
@@ -183,29 +256,79 @@ def run_data_pipeline(
         return {"train": merge(current["train"], cleaned, run_dir / "preprocessed.parquet",
                                (*profile_outputs, PREPROCESSING_MARKER))}
 
-    def engineer(current: dict[str, Path]) -> dict[str, Path]:
-        print("[processing] RUN customer_month_features")
-        features = ensure_customer_month_feature_store(
-            current["train"], run_dir / "features.parquet", force_process=force_process,
+    def feature_step(name: str, outputs: tuple[str, ...]) -> ProcessingStep:
+        def engineer(current: dict[str, Path]) -> dict[str, Path]:
+            # Outer orchestration has already decided RUN. Force precisely this
+            # contract even if its current values exist in the source snapshot.
+            features = materialize_customer_month_feature_group(
+                current["train"], run_dir / f"{name}_features.parquet",
+                outputs=outputs, force_process=True,
+                memory_limit=memory_limit, temp_directory=spill,
+            )
+            destination = merge(current["train"], features, run_dir / f"{name}_candidate.parquet", outputs)
+            # Only discard this run's earlier feature candidates, never retained
+            # versions, raw data, preprocessing metadata, or external sources.
+            previous = current["train"]
+            if previous.parent.resolve() == run_dir.resolve() and previous.name.endswith("_candidate.parquet"):
+                previous.unlink()
+            return {"train": destination}
+
+        return ProcessingStep(name, outputs, PIPELINE_FUNCTION_INPUTS[name], engineer, validate)
+
+    def preprocess_income(current: dict[str, Path]) -> dict[str, Path]:
+        # Fit the approved RFM rule on upstream income, before baseline fill/clip.
+        result = preprocess_renta_monetary(
+            ingest(), run_dir / "renta_monetary.parquet", force_process=True,
             memory_limit=memory_limit, temp_directory=spill,
         )
-        return {"train": merge(current["train"], features, run_dir / "candidate.parquet", ENGINEERED_FEATURES)}
+        income = copy_query(
+            f"SELECT ncodpers, fecha_dato, {', '.join(RENTA_OUTPUTS)}, renta_filled AS renta "
+            f"FROM {parquet(result)}", run_dir / "income.parquet",
+        )
+        return {"train": merge(current["train"], income, run_dir / "income_candidate.parquet",
+                               (*RENTA_OUTPUTS, "renta"))}
 
     steps = [
         ProcessingStep("customer_profile_preprocessing", (*profile_outputs, PREPROCESSING_MARKER),
                        (*KEY_COLUMNS, "age", "antiguedad", "renta"), preprocess, validate),
-        ProcessingStep("customer_month_features", ENGINEERED_FEATURES,
-                       (*KEY_COLUMNS, *RAW_PERSONA_COLUMNS, *PRODUCT_COLUMNS), engineer, validate),
+        ProcessingStep("renta_monetary_preprocessing", (*RENTA_OUTPUTS, "renta"),
+                       (*KEY_COLUMNS, "renta", "cod_prov", "pais_residencia"), preprocess_income, validate),
+        *(feature_step(name, outputs) for name, outputs in PIPELINE_FUNCTION_OUTPUTS.items()
+          if name not in {"customer_profile_preprocessing", "renta_monetary_preprocessing"}),
     ]
     candidates, processing = run_processing_pipeline(
         working, steps, force_process=force_process, required_features=required,
+        force_features=force_features, force_functions=force_functions,
     )
     validate(candidates)
+    # Bounded disk-backed verification before publication: unrelated values and
+    # their types must match the parent exactly, regardless of output ordering.
+    if parent:
+        before = working["train"]
+        after = candidates["train"]
+        replaced = {c for s in processing if s["decision"] == "RUN" for c in s["declared_outputs"]}
+        old_schema, new_schema = schema(before), schema(after)
+        preserved = [c for c in old_schema if c not in replaced]
+        if any(new_schema.get(c) != old_schema[c] for c in preserved):
+            raise ValueError("Processing changed unrelated column types")
+        projection = ", ".join(quote(c) for c in preserved)
+        with connect() as con:
+            changed = con.execute(
+                f"SELECT EXISTS ((SELECT {projection} FROM {parquet(before)} EXCEPT ALL "
+                f"SELECT {projection} FROM {parquet(after)}) UNION ALL "
+                f"(SELECT {projection} FROM {parquet(after)} EXCEPT ALL "
+                f"SELECT {projection} FROM {parquet(before)}))"
+            ).fetchone()[0]
+        if changed:
+            raise ValueError("Processing changed unrelated feature values")
     for summary in processing:
         print(json_summary(summary))
     print(f"[pipeline] required_features={list(required)} | final validation=PASS | publish_checkpoint={publish_checkpoint}")
     configuration = {
         "required_features": list(required), "force_process": force_process,
+        "force_features": list(force_features), "force_functions": list(force_functions),
+        "forced_functions_resolved": sorted(forced_steps),
+        "functions_to_run": [s["step"] for s in processing if s["decision"] == "RUN"],
         "publish_checkpoint": publish_checkpoint, "raw_filename": raw_filename,
         "chunksize": chunksize, "memory_limit": memory_limit,
         "renta_clip_upper_quantile": renta_clip_upper_quantile,
@@ -218,7 +341,7 @@ def run_data_pipeline(
     version = store.publish(
         candidates, parent_version=parent["version"] if parent else None,
         processing=processing, configuration=configuration,
-        feature_definition_metadata={step.name: {"outputs": list(step.outputs)} for step in steps},
+        feature_definition_metadata={step.name: {"outputs": list(step.outputs), "inputs": list(step.required_inputs)} for step in steps},
     ) if publish_checkpoint else None
     path = store.root / version["artifacts"]["train"]["path"] if version else candidates["train"]
     return {"status": "published" if version else "candidate", "customer_month": path,
