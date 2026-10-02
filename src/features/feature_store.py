@@ -69,7 +69,7 @@ def ensure_customer_month_feature_store(
     _materialize_history_group(source, history_path, force_process=force_process, memory_limit=memory_limit, temp_directory=temp_directory)
 
     source_columns = _columns(source)
-    products = [name for name in source_columns if name.endswith("_ult1")]
+    products = [name for name in source_columns if name.endswith("_ult1") and not name.startswith(("prev_", "acq_"))]
     required = {
         *KEY_COLUMNS, *PERSONA_FEATURES, *HISTORY_FEATURE_NAMES,
         *acquisition_feature_names(products),
@@ -80,8 +80,8 @@ def ensure_customer_month_feature_store(
     return destination
 
 
-def _materialize_persona_group(source: Path, destination: Path, *, force_process: bool, memory_limit: str | None, temp_directory: str | Path | None) -> None:
-    required = {*KEY_COLUMNS, *PERSONA_FEATURES}
+def _materialize_persona_group(source: Path, destination: Path, *, force_process: bool, memory_limit: str | None, temp_directory: str | Path | None, output_features: Sequence[str] = PERSONA_FEATURES) -> None:
+    required = {*KEY_COLUMNS, *output_features}
     if destination.is_file() and not force_process and required.issubset(_columns(destination)):
         return
     con = _connect(memory_limit, temp_directory)
@@ -89,7 +89,7 @@ def _materialize_persona_group(source: Path, destination: Path, *, force_process
         columns = _columns(source, con)
         _require_keys(columns, source)
         raw_persona = raw_persona_projection_sql("source", columns)
-        persona = persona_feature_projection_sql()
+        persona = persona_feature_projection_sql(features=output_features)
         source_sql = _path(source)
         _copy_query(con, f"""
             WITH source_rows AS (
@@ -101,27 +101,31 @@ def _materialize_persona_group(source: Path, destination: Path, *, force_process
                 WINDOW customer_time AS (PARTITION BY ncodpers ORDER BY fecha_dato),
                        prior_customer_rows AS (PARTITION BY ncodpers ORDER BY fecha_dato ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)
             )
-            SELECT ncodpers, fecha_dato, {', '.join(quote(name) for name in PERSONA_FEATURES)}
+            SELECT ncodpers, fecha_dato, {', '.join(quote(name) for name in output_features)}
             FROM ordered
         """, destination)
     finally:
         con.close()
 
 
-def _materialize_history_group(source: Path, destination: Path, *, force_process: bool, memory_limit: str | None, temp_directory: str | Path | None) -> None:
+def _materialize_history_group(source: Path, destination: Path, *, force_process: bool, memory_limit: str | None, temp_directory: str | Path | None, output_features: Sequence[str] | None = None) -> None:
     con = _connect(memory_limit, temp_directory)
     try:
         columns = _columns(source, con)
         _require_keys(columns, source)
-        products = [name for name in columns if name.endswith("_ult1")]
+        products = [name for name in columns if name.endswith("_ult1") and not name.startswith(("prev_", "acq_"))]
         if not products:
             raise ValueError("Source has no product columns ending in '_ult1'.")
-        required = {*KEY_COLUMNS, *HISTORY_FEATURE_NAMES, *acquisition_feature_names(products)}
+        all_outputs = (*HISTORY_FEATURE_NAMES, *("prev_" + name for name in products), *acquisition_feature_names(products))
+        selected = tuple(output_features) if output_features is not None else all_outputs
+        if missing := set(selected).difference(all_outputs):
+            raise ValueError(f"Unknown history outputs: {sorted(missing)}")
+        required = {*KEY_COLUMNS, *selected}
         if destination.is_file() and not force_process and required.issubset(_columns(destination, con)) and not _has_legacy_history_columns(destination):
             return
         product_sql = ", ".join(f"source.{quote(name)}" for name in products)
         previous_raw = ", ".join(f"LAG({quote(name)}) OVER customer_time AS {quote('previous_' + name)}" for name in products)
-        previous_states = ", ".join(f"CAST(COALESCE({quote('previous_' + name)}, 0) AS TINYINT) AS {quote('prev_' + name)}" for name in products)
+        previous_states = ", ".join(f"CAST(COALESCE({quote('previous_' + name)}, 0) AS TINYINT) AS {quote('prev_' + name)}" for name in products if 'prev_' + name in selected)
         # EDA acquisition features compare the current state with the nearest
         # prior *record*, including across calendar gaps.  The first observed
         # customer record remains NULL because no comparison is possible.
@@ -130,17 +134,26 @@ def _materialize_history_group(source: Path, destination: Path, *, force_process
             f"WHEN COALESCE({quote('previous_' + name)}, 0) = 0 "
             f"AND COALESCE({quote(name)}, 0) = 1 THEN 1 ELSE 0 END AS TINYINT) "
             f"AS {quote('acq_' + name)}"
-            for name in products
+            for name in products if 'acq_' + name in selected
         )
-        history = ", ".join([
-            record_gap_months_sql(output=True),
-            acquisitions_last_1m_sql(), acquisitions_last_3m_sql(), acquisitions_last_6m_sql(), cumulative_drops_sql(),
-        ])
-        rfm_features = ", ".join([
-            "CAST(previous_date IS NOT NULL AS TINYINT) AS rfm_has_previous_record",
-            rfm_recency_months_sql(), rfm_never_acquired_before_sql(), rfm_frequency_sql(),
-            rfm_monetary_sql(products), rfm_history_coverage_sql(),
-        ])
+        builders = {
+            "record_gap_months": lambda: record_gap_months_sql(output=True),
+            "acquisitions_last_1m": acquisitions_last_1m_sql,
+            "acquisitions_last_3m": acquisitions_last_3m_sql,
+            "acquisitions_last_6m": acquisitions_last_6m_sql,
+            "cumulative_drops": cumulative_drops_sql,
+            "rfm_has_previous_record": lambda: "CAST(previous_date IS NOT NULL AS TINYINT) AS rfm_has_previous_record",
+            "rfm_recency_months": rfm_recency_months_sql,
+            "rfm_never_acquired_before": rfm_never_acquired_before_sql,
+            "rfm_frequency": rfm_frequency_sql,
+            "rfm_monetary": lambda: rfm_monetary_sql(products),
+            "rfm_observed_history_records": rfm_history_coverage_sql,
+        }
+        projection = ", ".join(filter(None, [
+            previous_states, acquisitions,
+            *(builders[name]() for name in selected if name in builders),
+        ]))
+        raw_products = product_sql.replace('source.', '') + ', ' if output_features is None else ''
         source_sql = _path(source)
         _copy_query(con, f"""
             WITH source_rows AS (
@@ -162,9 +175,7 @@ def _materialize_history_group(source: Path, destination: Path, *, force_process
                 SELECT *, {rfm_acquisition_count_sql(products)} AS rfm_n_acquisition
                 FROM events
             )
-            SELECT ncodpers, fecha_dato, {product_sql.replace('source.', '')},
-                   {previous_states}, {acquisitions}, {history}
-                   , {rfm_features}
+            SELECT ncodpers, fecha_dato, {raw_products}{projection}
             FROM rfm_events
             WINDOW prior_rows AS (PARTITION BY ncodpers ORDER BY fecha_dato ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING),
                    recent_1m AS (PARTITION BY ncodpers ORDER BY CAST(fecha_dato AS DATE) RANGE BETWEEN INTERVAL 1 MONTH PRECEDING AND INTERVAL 1 DAY PRECEDING),
@@ -173,6 +184,42 @@ def _materialize_history_group(source: Path, destination: Path, *, force_process
         """, destination)
     finally:
         con.close()
+
+
+def materialize_customer_month_feature_group(
+    source_path: str | Path,
+    destination_path: str | Path,
+    *,
+    outputs: Sequence[str],
+    force_process: bool = False,
+    memory_limit: str | None = None,
+    temp_directory: str | Path | None = None,
+) -> Path:
+    """Materialize only one declared output contract from the working snapshot.
+
+    The canonical pipeline merges this narrow result into a new full candidate.
+    Unselected output builders are never called. Common SQL intermediates
+    remain internal; they are not persisted as replacements for other features.
+    """
+    source, destination = Path(source_path), Path(destination_path)
+    if not source.is_file():
+        raise FileNotFoundError(source)
+    if not outputs:
+        raise ValueError("Feature group must declare at least one output")
+    if set(outputs).issubset(_columns(source)) and not force_process:
+        return source
+    if source.resolve() == destination.resolve():
+        raise ValueError("Feature-group destination must differ from source")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if set(outputs).issubset(PERSONA_FEATURES):
+        _materialize_persona_group(source, destination, output_features=outputs,
+                                  force_process=True, memory_limit=memory_limit, temp_directory=temp_directory)
+    else:
+        _materialize_history_group(source, destination, output_features=outputs,
+                                  force_process=True, memory_limit=memory_limit, temp_directory=temp_directory)
+    if missing := set(outputs).difference(_columns(destination)):
+        raise RuntimeError(f"Feature group did not materialize outputs: {sorted(missing)}")
+    return destination
 
 
 def _merge_groups(history_path: Path, persona_path: Path, destination: Path, *, memory_limit: str | None, temp_directory: str | Path | None) -> None:

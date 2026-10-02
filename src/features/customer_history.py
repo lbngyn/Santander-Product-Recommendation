@@ -52,7 +52,7 @@ def product_event_count_sql(
         raise ValueError("event must be 'acquisition' or 'drop'.")
     before, after = (0, 1) if event == "acquisition" else (1, 0)
     parts = [
-        f"CASE WHEN {quote(gap_column)} = 1 "
+        f"CASE WHEN {quote(gap_column)} {'IS NOT NULL' if event == 'acquisition' else '= 1'} "
         f"AND COALESCE({quote(previous_prefix + product)}, 0) = {before} "
         f"AND COALESCE({quote(product)}, 0) = {after} THEN 1 ELSE 0 END"
         for product in product_columns
@@ -63,7 +63,7 @@ def product_event_count_sql(
 def acquisition_label_sql(product: str, *, previous_prefix: str = "previous_", gap_column: str = "record_gap_months") -> str:
     """Return the label expression for one product's valid acquisition."""
     return (
-        f"CAST(CASE WHEN {quote(gap_column)} = 1 "
+        f"CAST(CASE WHEN {quote(gap_column)} IS NOT NULL "
         f"AND COALESCE({quote(previous_prefix + product)}, 0) = 0 "
         f"AND COALESCE({quote(product)}, 0) = 1 THEN 1 ELSE 0 END AS TINYINT)"
     )

@@ -4,12 +4,12 @@ from src.preprocessing.customer_profile import (
     BaselineProfilePreprocessingStats,
     fit_baseline_profile_preprocessing,
     preprocess_customer_profile_baseline,
-    transform_customer_profiles_bidirectional,
+    transform_customer_profiles_past_only,
 )
 
 __all__ = [
     "BaselineProfilePreprocessingStats",
     "fit_baseline_profile_preprocessing",
     "preprocess_customer_profile_baseline",
-    "transform_customer_profiles_bidirectional",
+    "transform_customer_profiles_past_only",
 ]

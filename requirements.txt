@@ -10,3 +10,4 @@ hydra-core
 mlflow
 dvc
 lightgbm
+pymc-marketing

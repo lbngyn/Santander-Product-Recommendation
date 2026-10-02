@@ -15,9 +15,8 @@ from src.features.persona import MODEL_PERSONA_FEATURES, PERSONA_FEATURES, perso
 def build_model_panel(source_path: str | Path, destination_path: str | Path, *, history_feature_sql: Sequence[str], selected_rows_sql: str | None = None, selection_columns: Sequence[str] = (), force_process: bool = False, memory_limit: str | None = None, temp_directory: str | Path | None = None) -> Path:
     """Materialise sample ``t`` using profiles at ``t`` and history before it.
 
-    Acquisition/drop events and derived RFM features are valid only where the
-    preceding customer record is exactly one month earlier. Gapped records stay
-    observable (via ``record_gap_months``), but are not labelled transitions.
+    Acquisition events compare nearest observed records, including gaps.
+    Drop events retain their one-month rule. History excludes the current event.
     """
     source, destination = Path(source_path), Path(destination_path)
     if not history_feature_sql:
@@ -151,7 +150,7 @@ def build_model_panel_from_feature_store(
             name for name in columns if name in MODEL_PERSONA_FEATURES or name in HISTORY_FEATURE_NAMES
         )
         labels = ", ".join(
-            f"CAST(CASE WHEN record_gap_months = 1 AND COALESCE({quote('prev_' + product)}, 0) = 0 "
+            f"CAST(CASE WHEN rfm_has_previous_record = 1 AND COALESCE({quote('prev_' + product)}, 0) = 0 "
             f"AND COALESCE({quote(product)}, 0) = 1 THEN 1 ELSE 0 END AS TINYINT) AS {quote('acq_' + product)}"
             for product in products
         )

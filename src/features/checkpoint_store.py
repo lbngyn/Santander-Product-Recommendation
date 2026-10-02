@@ -182,25 +182,20 @@ def run_processing_pipeline(
     *,
     force_process: bool,
     required_features: Sequence[str],
+    force_features: Sequence[str] = (),
+    force_functions: Sequence[str] = (),
 ) -> tuple[dict[str, Path], list[dict[str, Any]]]:
     """Run/skip declared feature groups and enforce their common contract."""
     current = {name: Path(path) for name, path in working.items()}
+    plan = plan_processing_pipeline(steps, _shared_columns(current), force_process=force_process,
+                                    force_features=force_features, force_functions=force_functions)
     history: list[dict[str, Any]] = []
-    for step in steps:
+    for step, summary in zip(steps, plan):
         columns = _shared_columns(current)
         missing_inputs = set(step.required_inputs).difference(columns)
-        if missing_inputs:
+        if missing_inputs and summary["decision"] == "RUN":
             raise ValueError(f"Processing step {step.name!r} is missing inputs: {sorted(missing_inputs)}")
-        missing_outputs = sorted(set(step.outputs).difference(columns))
-        decision = "RUN" if force_process or missing_outputs else "SKIP"
-        summary: dict[str, Any] = {
-            "step": step.name,
-            "declared_outputs": list(step.outputs),
-            "existing_outputs": sorted(set(step.outputs).intersection(columns)),
-            "missing_outputs": missing_outputs,
-            "force_process": force_process,
-            "decision": decision,
-        }
+        decision = summary["decision"]
         if decision == "RUN":
             current = {name: Path(path) for name, path in step.run(dict(current)).items()}
             after = _shared_columns(current)
@@ -217,6 +212,84 @@ def run_processing_pipeline(
     if missing := set(required_features).difference(final_columns):
         raise RuntimeError(f"Pipeline did not satisfy required features: {sorted(missing)}")
     return current, history
+
+
+def plan_processing_pipeline(
+    steps: Sequence[ProcessingStep],
+    existing_columns: Sequence[str] | set[str],
+    *,
+    force_process: bool = False,
+    force_features: Sequence[str] = (),
+    force_functions: Sequence[str] = (),
+) -> list[dict[str, Any]]:
+    """Plan ordered contracts without invoking functions or creating files.
+
+    Input columns refreshed by an earlier RUN invalidate their consumers,
+    transitively. Contracts must be ordered upstream before downstream. Shared
+    outputs (such as age) do not create a dependency on a later producer.
+    """
+    if len({s.name for s in steps}) != len(steps):
+        raise ValueError("Processing function names must be unique")
+    forced = resolve_forced_steps({s.name: s.outputs for s in steps},
+                                 force_features=force_features, force_functions=force_functions)
+    columns = set(existing_columns)
+    changed_by: dict[str, str] = {}
+    plan = []
+    for step in steps:
+        missing = sorted(set(step.outputs) - columns)
+        upstream = sorted({changed_by[c] for c in step.required_inputs if c in changed_by})
+        explicit = force_process or step.name in forced
+        run = bool(explicit or missing or upstream)
+        reasons = []
+        if force_process:
+            reasons.append("global_force")
+        elif explicit:
+            reasons.append("selected")
+        if missing:
+            reasons.append("missing_outputs")
+        if upstream:
+            reasons.append("upstream_changed")
+        plan.append({
+            "step": step.name, "declared_outputs": list(step.outputs),
+            "required_inputs": list(step.required_inputs),
+            "existing_outputs": sorted(set(step.outputs) & columns),
+            "missing_outputs": missing, "force_process": explicit or bool(upstream),
+            "forced_features": sorted(set(step.outputs) & set(force_features)),
+            "forced_function": step.name in force_functions,
+            "upstream_functions": upstream, "decision": "RUN" if run else "SKIP",
+            "reasons": reasons or ["outputs_exist"],
+        })
+        if run:
+            changed_by.update({c: step.name for c in step.outputs})
+            columns.update(step.outputs)
+    return plan
+
+
+def resolve_forced_steps(
+    function_outputs: Mapping[str, Sequence[str]],
+    *,
+    force_features: Sequence[str] = (),
+    force_functions: Sequence[str] = (),
+) -> set[str]:
+    """Map explicit feature/function selections to their declared owners.
+
+    Recompute the whole output contract of each selected function. Fail on
+    unknown selections before any processing. This helper selects the starting
+    functions; the planner then propagates updated inputs to consumers.
+    """
+    if isinstance(force_features, str) or isinstance(force_functions, str):
+        raise TypeError("force_features and force_functions must be lists/tuples, not strings")
+    known_features = {feature for outputs in function_outputs.values() for feature in outputs}
+    unknown_features = set(force_features).difference(known_features)
+    unknown_functions = set(force_functions).difference(function_outputs)
+    if unknown_features or unknown_functions:
+        raise ValueError(
+            f"Unknown force selections: features={sorted(unknown_features)}, "
+            f"functions={sorted(unknown_functions)}. Available functions: {sorted(function_outputs)}"
+        )
+    return set(force_functions) | {
+        name for name, outputs in function_outputs.items() if set(outputs).intersection(force_features)
+    }
 
 
 def _shared_columns(artifacts: Mapping[str, Path]) -> set[str]:

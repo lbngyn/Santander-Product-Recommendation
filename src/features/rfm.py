@@ -30,12 +30,11 @@ def rfm_acquisition_count_sql(
 ) -> str:
     """Return the current row's count of valid product-acquisition events.
 
-    A product is acquired only when the nearest observed predecessor is one
-    calendar month earlier and the product state changes from 0 to 1.  Gapped
-    observations are deliberately not inferred as product transitions.
+    Compare with the nearest observed predecessor, including calendar gaps.
+    The first customer record has no predecessor and contributes no event.
     """
     events = [
-        f"CASE WHEN {quote(gap_column)} = 1 "
+        f"CASE WHEN {quote(gap_column)} IS NOT NULL "
         f"AND COALESCE({quote(previous_prefix + product)}, 0) = 0 "
         f"AND COALESCE({quote(product)}, 0) = 1 THEN 1 ELSE 0 END"
         for product in product_columns

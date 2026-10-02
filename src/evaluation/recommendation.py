@@ -19,6 +19,7 @@ def evaluate_independent_models(
     *,
     validation_date: str,
     top_k: int,
+    require_adjacent_month: bool = False,
 ) -> dict[str, float | int | str]:
     """Score a temporal holdout and persist masked Top-K recommendations."""
     if top_k < 1:
@@ -27,9 +28,9 @@ def evaluate_independent_models(
     metadata = {product: load_artifact_metadata(path) for product, path in artifact_directories.items()}
     feature_names = sorted({feature for artifact in metadata.values() for feature in artifact.schema.feature_names})
     required = ["ncodpers", *feature_names, *["prev_" + product for product in products], *["acq_" + product for product in products]]
-    frame = _load_holdout(panel_path, required, validation_date)
+    frame = _load_holdout(panel_path, required, validation_date, require_adjacent_month=require_adjacent_month)
     if frame.empty:
-        raise ValueError(f"No adjacent-month validation rows found for {validation_date}.")
+        raise ValueError(f"No validation rows with a preceding record found for {validation_date}.")
 
     scores: dict[str, pd.Series] = {}
     for product, directory in artifact_directories.items():
@@ -94,7 +95,7 @@ def recommendation_metrics(targets: np.ndarray, ranking: np.ndarray, selected_sc
     }
 
 
-def _load_holdout(panel_path: str | Path, columns: list[str], validation_date: str) -> pd.DataFrame:
+def _load_holdout(panel_path: str | Path, columns: list[str], validation_date: str, *, require_adjacent_month: bool = False) -> pd.DataFrame:
     con = duckdb.connect(database=":memory:")
     try:
         available = {row[0] for row in con.execute("DESCRIBE SELECT * FROM read_parquet(?)", [str(panel_path)]).fetchall()}
@@ -102,8 +103,9 @@ def _load_holdout(panel_path: str | Path, columns: list[str], validation_date: s
         if missing:
             raise ValueError(f"Validation panel is missing columns: {sorted(missing)}")
         projection = ", ".join('"' + name.replace('"', '""') + '"' for name in columns)
+        transition = "record_gap_months = 1" if require_adjacent_month else "record_gap_months IS NOT NULL"
         return con.execute(
-            f"SELECT {projection} FROM read_parquet(?) WHERE CAST(fecha_dato AS DATE) = CAST(? AS DATE) AND record_gap_months = 1",
+            f"SELECT {projection} FROM read_parquet(?) WHERE CAST(fecha_dato AS DATE) = CAST(? AS DATE) AND {transition}",
             [str(panel_path), validation_date],
         ).fetchdf()
     finally:

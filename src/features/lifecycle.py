@@ -59,7 +59,7 @@ def materialize_customer_lifecycle(
         columns = _columns(con, source)
         if missing := {"ncodpers", "fecha_dato"}.difference(columns):
             raise ValueError(f"Source is missing lifecycle keys: {sorted(missing)}")
-        products = [name for name in columns if name.endswith("_ult1")]
+        products = [name for name in columns if name.endswith("_ult1") and not name.startswith(("prev_", "acq_"))]
         if not products:
             raise ValueError("Source has no product columns ending in '_ult1'.")
         required_output = {"ncodpers", "fecha_dato", *LIFECYCLE_FEATURE_NAMES}
@@ -72,7 +72,7 @@ def materialize_customer_lifecycle(
         product_lag = ", ".join(f"LAG({quote(product)}) OVER customer_time AS {quote('previous_' + product)}" for product in products)
         portfolio = " + ".join(f"CASE WHEN {quote(product)} = 1 THEN 1 ELSE 0 END" for product in products)
         acquisitions = " + ".join(
-            f"CASE WHEN record_gap_months = 1 AND COALESCE({quote('previous_' + product)}, 0) = 0 "
+            f"CASE WHEN previous_date IS NOT NULL AND COALESCE({quote('previous_' + product)}, 0) = 0 "
             f"AND COALESCE({quote(product)}, 0) = 1 THEN 1 ELSE 0 END"
             for product in products
         )

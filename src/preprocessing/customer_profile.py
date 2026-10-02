@@ -1,11 +1,4 @@
-"""Customer-profile cleaning used by the first reproducible baseline.
-
-This module deliberately preserves raw profile columns and categorical levels:
-it performs neither encoding nor feature engineering.  Its train transform can
-use a value after a missing row for *offline data repair*.  That is useful for
-the requested baseline dataset, but is not valid for time-based validation or
-online scoring.  Set ``allow_future_values=False`` for those workflows.
-"""
+"""Past-only customer-profile cleaning for reproducible temporal pipelines."""
 from __future__ import annotations
 
 import json
@@ -80,22 +73,19 @@ def fit_baseline_profile_preprocessing(
     )
 
 
-def transform_customer_profiles_bidirectional(
+def transform_customer_profiles_past_only(
     source_path: str | Path,
     destination_path: str | Path,
     stats: BaselineProfilePreprocessingStats,
     *,
     history_path: str | Path | None = None,
-    allow_future_values: bool = False,
     memory_limit: str | None = None,
     temp_directory: str | Path | None = None,
 ) -> Path:
-    """Fill profile fields from the same customer and write a Parquet artifact.
+    """Fill profile fields using only values known at or before each row.
 
-    Numeric values between two observations are the arithmetic mean requested
-    for baseline v0.  A one-sided observation supplies the nearest value.
-    Categorical/date values use the closest observed record; categorical
-    residual nulls become ``__MISSING__`` and date residuals remain null.
+    Numeric residuals use training-set statistics. Categorical residuals
+    become ``__MISSING__`` and date residuals remain null.
     """
     source, destination = Path(source_path), Path(destination_path)
     history = Path(history_path) if history_path else None
@@ -119,7 +109,6 @@ def transform_customer_profiles_bidirectional(
             source_columns,
             profile_columns,
             stats,
-            allow_future_values=allow_future_values,
         )
         temporary = destination.with_suffix(destination.suffix + ".tmp")
         if temporary.exists():
@@ -139,7 +128,6 @@ def preprocess_customer_profile_baseline(
     output_dir: str | Path,
     *,
     force_process: bool = False,
-    allow_future_values_within_train: bool = True,
     memory_limit: str | None = None,
     temp_directory: str | Path | None = None,
     renta_clip_upper_quantile: float = 0.99,
@@ -157,14 +145,13 @@ def preprocess_customer_profile_baseline(
         return {"train": str(output_train), "test": str(output_test) if test else None, "stats": str(stats_path), "status": "reused"}
 
     stats = fit_baseline_profile_preprocessing(train, renta_clip_upper_quantile=renta_clip_upper_quantile)
-    transform_customer_profiles_bidirectional(
-        train, output_train, stats, allow_future_values=allow_future_values_within_train,
+    transform_customer_profiles_past_only(
+        train, output_train, stats,
         memory_limit=memory_limit, temp_directory=temp_directory,
     )
     if test is not None:
-        # A future test row is unavailable at scoring time; test is always past-only.
-        transform_customer_profiles_bidirectional(
-            test, output_test, stats, history_path=train, allow_future_values=False,
+        transform_customer_profiles_past_only(
+            test, output_test, stats, history_path=train,
             memory_limit=memory_limit, temp_directory=temp_directory,
         )
     stats_path.write_text(json.dumps(asdict(stats), indent=2), encoding="utf-8")
@@ -178,7 +165,7 @@ def _profile_columns(columns: list[str]) -> list[str]:
     ]
 
 
-def _transform_query(source: Path, history: Path | None, source_columns: list[str], profile_columns: list[str], stats: BaselineProfilePreprocessingStats, *, allow_future_values: bool) -> str:
+def _transform_query(source: Path, history: Path | None, source_columns: list[str], profile_columns: list[str], stats: BaselineProfilePreprocessingStats) -> str:
     cleaned = {column: _clean_expression(column) for column in profile_columns}
     projection = ", ".join(f"{expression} AS {_quote(column)}" for column, expression in cleaned.items())
     history_cte = ""
@@ -189,30 +176,17 @@ def _transform_query(source: Path, history: Path | None, source_columns: list[st
         f"LAST_VALUE(CASE WHEN {_quote(column)} IS NOT NULL THEN fecha_dato END IGNORE NULLS) OVER previous_{index} AS prev_date_{index}"
         for index, column in enumerate(profile_columns)
     )
-    next_values = ",\n                ".join(
-        f"FIRST_VALUE({_quote(column)} IGNORE NULLS) OVER following_{index} AS next_{index}, "
-        f"FIRST_VALUE(CASE WHEN {_quote(column)} IS NOT NULL THEN fecha_dato END IGNORE NULLS) OVER following_{index} AS next_date_{index}"
-        for index, column in enumerate(profile_columns)
-    ) if allow_future_values else ""
     filled = ",\n                ".join(
-        _fill_expression(column, index, stats, allow_future_values) + f" AS {_quote('filled_' + column)}"
+        _fill_expression(column, index, stats) + f" AS {_quote('filled_' + column)}"
         for index, column in enumerate(profile_columns)
     )
     excluded = ", ".join(_quote(column) for column in profile_columns)
     base_select = f"base.* EXCLUDE ({excluded})" if excluded else "base.*"
     output = ",\n            ".join([base_select, *(f"filled.{_quote('filled_' + c)} AS {_quote(c)}" for c in profile_columns)])
-    following_window = ""
-    if allow_future_values:
-        following_window = ",\n                ".join(
-            f"following_{index} AS (PARTITION BY ncodpers ORDER BY fecha_dato, source_rank ROWS BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING)"
-            for index, _ in enumerate(profile_columns)
-        )
     previous_window = ",\n                ".join(
         f"previous_{index} AS (PARTITION BY ncodpers ORDER BY fecha_dato, source_rank ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)"
         for index, _ in enumerate(profile_columns)
     )
-    window_clause = previous_window + (",\n                " + following_window if following_window else "")
-    next_projection = (",\n                " + next_values) if next_values else ""
     return f"""
         WITH target_base AS (SELECT * FROM read_parquet('{_quote_path(source)}')),
         combined AS (
@@ -221,9 +195,9 @@ def _transform_query(source: Path, history: Path | None, source_columns: list[st
         ),
         neighbour_values AS (
             SELECT *,
-                {previous_values}{next_projection}
+                {previous_values}
             FROM combined
-            WINDOW {window_clause}
+            WINDOW {previous_window}
         ),
         filled AS (
             SELECT ncodpers, fecha_dato,
@@ -244,36 +218,22 @@ def _clean_expression(column: str) -> str:
     return quoted
 
 
-def _fill_expression(column: str, index: int, stats: BaselineProfilePreprocessingStats, allow_future_values: bool) -> str:
+def _fill_expression(column: str, index: int, stats: BaselineProfilePreprocessingStats) -> str:
     current, previous = _quote(column), f"prev_{index}"
-    following = f"next_{index}" if allow_future_values else "NULL"
     if column in NUMERIC_PROFILE_COLUMNS:
         fallback = getattr(stats, f"{column}_median")
-        candidate = (
-            f"CASE WHEN {current} IS NOT NULL THEN {current} "
-            f"WHEN {previous} IS NOT NULL AND {following} IS NOT NULL THEN ({previous} + {following}) / 2.0 "
-            f"ELSE COALESCE({previous}, {following}, {fallback}) END"
-        )
+        candidate = f"COALESCE({current}, {previous}, {fallback})"
         return f"LEAST({candidate}, {stats.renta_clip_upper})" if column == "renta" else candidate
     if column in DATE_PROFILE_COLUMNS:
-        return _nearest_expression(current, previous, following, index, allow_future_values, residual="NULL")
-    result = _nearest_expression(current, previous, following, index, allow_future_values, residual=f"'{MISSING_CATEGORY}'")
+        return _past_value_expression(current, previous, residual="NULL")
+    result = _past_value_expression(current, previous, residual=f"'{MISSING_CATEGORY}'")
     if column == "indrel_1mes":
         return f"CASE WHEN {result} IN ('1', '1.0') THEN '1' ELSE {result} END"
     return result
 
 
-def _nearest_expression(current: str, previous: str, following: str, index: int, allow_future_values: bool, *, residual: str) -> str:
-    if not allow_future_values:
-        value = f"COALESCE({current}, {previous})"
-    else:
-        value = (
-            f"CASE WHEN {current} IS NOT NULL THEN {current} "
-            f"WHEN {previous} IS NULL THEN {following} WHEN {following} IS NULL THEN {previous} "
-            f"WHEN date_diff('day', TRY_CAST(prev_date_{index} AS DATE), TRY_CAST(fecha_dato AS DATE)) "
-            f"<= date_diff('day', TRY_CAST(fecha_dato AS DATE), TRY_CAST(next_date_{index} AS DATE)) THEN {previous} "
-            f"ELSE {following} END"
-        )
+def _past_value_expression(current: str, previous: str, *, residual: str) -> str:
+    value = f"COALESCE({current}, {previous})"
     if residual == "NULL":
         return value
     return f"COALESCE(NULLIF(TRIM(CAST({value} AS VARCHAR)), ''), {residual})"

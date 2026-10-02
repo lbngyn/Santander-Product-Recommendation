@@ -25,8 +25,8 @@ def build_acquisition_features(
 ) -> dict[str, object]:
     """Persist 0->1 product transitions as TINYINT acquisition targets.
 
-    An acquisition is valid only for a consecutive monthly 0->1 transition.
-    A customer's first record, gapped records, and every non-0->1 transition
+    An acquisition compares the nearest observed records, including gaps.
+    A customer's first record and every non-0->1 transition
     receive 0. Processing uses DuckDB windows and Parquet COPY so panel data
     is never materialised in pandas.
     """
@@ -108,7 +108,7 @@ def _write_acquisition_train(
     source_target_columns = [column for column in target_columns if column in source_columns]
     source_projection = "*" if not source_target_columns else f"* EXCLUDE ({', '.join(_quote(column) for column in source_target_columns)})"
     target_expressions = ",\n            ".join(
-        f"CAST(CASE WHEN date_diff('month', LAG(CAST(fecha_dato AS DATE)) OVER customer_time, CAST(fecha_dato AS DATE)) = 1 "
+        f"CAST(CASE WHEN LAG(fecha_dato) OVER customer_time IS NOT NULL "
         f"AND COALESCE(TRY_CAST({_quote(product)} AS TINYINT), 0) = 1 "
         f"AND COALESCE(TRY_CAST(LAG({_quote(product)}) OVER customer_time AS TINYINT), 0) = 0 "
         f"THEN 1 ELSE 0 END AS TINYINT) AS {_quote(target)}"

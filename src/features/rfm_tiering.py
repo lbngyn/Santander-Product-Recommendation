@@ -40,70 +40,25 @@ def build_renta_monetary_proxy(
     memory_limit: str | None = None,
     temp_directory: str | Path | None = None,
 ) -> Path:
-    """Materialise an offline income Monetary proxy for RFM segmentation.
+    """Project already-preprocessed canonical income; never impute again.
 
-    The priority is observed income, bidirectional customer fill, province
-    median for Spanish residents (or country median elsewhere), then a global
-    median. This is intentionally an offline segmentation artifact: its
-    bidirectional fill must not be used as a temporal-model input.
+    The shared pipeline owns customer_history_geo_median_v1 preprocessing.
+    Declared outputs: renta_filled, renta_imputation_method.
     """
     source, destination = Path(source_path), Path(destination_path)
     if not source.is_file():
-        raise FileNotFoundError(f"Source checkpoint not found: {source}")
-    required = {"ncodpers", "fecha_dato", "renta"}
-    destination.parent.mkdir(parents=True, exist_ok=True)
+        raise FileNotFoundError(source)
     con = _connect(memory_limit, temp_directory)
     try:
-        columns = _columns(con, source)
-        if missing := required.difference(columns):
-            raise ValueError(f"Source is missing renta-proxy columns: {sorted(missing)}")
-        output_columns = {"ncodpers", "fecha_dato", "renta_filled", "renta_imputation_method"}
-        if destination.is_file() and not force_process and output_columns.issubset(_columns(con, destination)):
-            return destination
-        province = "TRY_CAST(" + quote("cod_prov") + " AS INTEGER)" if "cod_prov" in columns else "NULL::INTEGER"
-        country = "NULLIF(TRIM(CAST(" + quote("pais_residencia") + " AS VARCHAR)), '')" if "pais_residencia" in columns else "NULL::VARCHAR"
+        outputs = {"ncodpers", "fecha_dato", "renta_filled", "renta_imputation_method"}
+        if missing := outputs.difference(_columns(con, source)):
+            raise ValueError(f"Canonical income is not preprocessed: {sorted(missing)}. Run Data Pipeline first.")
+        if source.resolve() == destination.resolve():
+            return source
+        destination.parent.mkdir(parents=True, exist_ok=True)
         temporary = destination.with_suffix(destination.suffix + ".tmp")
-        if temporary.exists():
-            temporary.unlink()
-        con.execute(f"""
-            COPY (
-                WITH rows AS (
-                    SELECT CAST(ncodpers AS BIGINT) AS ncodpers,
-                           CAST(fecha_dato AS DATE) AS fecha_dato,
-                           CASE WHEN TRY_CAST(renta AS DOUBLE) >= 0 THEN TRY_CAST(renta AS DOUBLE) END AS renta_raw,
-                           {province} AS cod_prov, {country} AS pais_residencia
-                    FROM read_parquet('{_path(source)}')
-                ), history AS (
-                    SELECT *, LAST_VALUE(renta_raw IGNORE NULLS) OVER (
-                        PARTITION BY ncodpers ORDER BY fecha_dato
-                        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-                    ) AS renta_past_fill,
-                    FIRST_VALUE(renta_raw IGNORE NULLS) OVER (
-                        PARTITION BY ncodpers ORDER BY fecha_dato
-                        ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING
-                    ) AS renta_future_fill,
-                    CASE WHEN pais_residencia = 'ES' AND cod_prov IS NOT NULL THEN 'PROV:' || CAST(cod_prov AS VARCHAR)
-                         WHEN pais_residencia IS NOT NULL AND pais_residencia <> 'ES' THEN 'COUNTRY:' || pais_residencia END AS geo_group
-                    FROM rows
-                ), geographic AS (
-                    SELECT *, MEDIAN(renta_raw) FILTER (WHERE renta_raw IS NOT NULL) OVER (
-                        PARTITION BY fecha_dato, geo_group
-                    ) AS geo_median,
-                    MEDIAN(renta_raw) FILTER (WHERE renta_raw IS NOT NULL) OVER (
-                        PARTITION BY fecha_dato
-                    ) AS global_median
-                    FROM history
-                )
-                SELECT ncodpers, fecha_dato,
-                       CAST(COALESCE(renta_raw, renta_past_fill, renta_future_fill, geo_median, global_median) AS DOUBLE) AS renta_filled,
-                       CASE WHEN renta_raw IS NOT NULL THEN 'observed'
-                            WHEN renta_past_fill IS NOT NULL THEN 'past_fill'
-                            WHEN renta_future_fill IS NOT NULL THEN 'future_fill'
-                            WHEN geo_median IS NOT NULL THEN 'geography_median'
-                            ELSE 'global_median' END AS renta_imputation_method
-                FROM geographic
-            ) TO '{_path(temporary)}' (FORMAT PARQUET, COMPRESSION ZSTD)
-        """)
+        con.execute(f"COPY (SELECT ncodpers, fecha_dato, renta_filled, renta_imputation_method "
+                    f"FROM read_parquet('{_path(source)}')) TO '{_path(temporary)}' (FORMAT PARQUET, COMPRESSION ZSTD)")
         temporary.replace(destination)
         return destination
     finally:

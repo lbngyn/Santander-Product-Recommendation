@@ -37,7 +37,7 @@ def build_model_panel_v1(source_path: str | Path, destination_path: str | Path, 
         previous_sql = ", ".join(f"CAST(COALESCE(LAG({q(product)}) OVER customer_time, 0) AS TINYINT) AS {q('prev_' + product)}" for product in products)
         record_gap_sql = "CAST(date_diff('month', LAG(CAST(fecha_dato AS DATE)) OVER customer_time, CAST(fecha_dato AS DATE)) AS INTEGER)"
         label_sql = ", ".join(
-            f"CAST(CASE WHEN {record_gap_sql} = 1 AND COALESCE(LAG({q(product)}) OVER customer_time, 0) = 0 AND COALESCE({q(product)}, 0) = 1 THEN 1 ELSE 0 END AS TINYINT) AS {q('acq_' + product)}"
+            f"CAST(CASE WHEN {record_gap_sql} IS NOT NULL AND COALESCE(LAG({q(product)}) OVER customer_time, 0) = 0 AND COALESCE({q(product)}, 0) = 1 THEN 1 ELSE 0 END AS TINYINT) AS {q('acq_' + product)}"
             for product in products
         )
         temporary = destination.with_suffix(destination.suffix + ".tmp")
