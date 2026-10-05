@@ -1,0 +1,36 @@
+pipeline:
+  version: lightgbm-acquisition-only-independent-v1
+  description: Original-information acquisition-only independent LightGBM pipeline.
+  approach: independent
+  comparison_id: original-acquisition-only-v1
+  project_id: santander-product-recommendation
+data:
+  checkpoint_version: null
+split:
+  validation_start: '2016-05-01'
+  validation_end: '2016-06-01'
+features:
+  scope: original_information
+  income_policy: accepted_canonical_static
+  acquisition_policy: nearest_previous_observed_record
+model:
+  version: original-acquisition-independent-v1
+  n_estimators: 300
+  random_state: 42
+  lightgbm_params:
+    learning_rate: 0.05
+    num_leaves: 31
+    max_bin: 255
+    force_col_wise: true
+    histogram_pool_size: 256
+    verbosity: -1
+runtime:
+  memory_limit: 2GB
+  threads: 2
+  batch_customer_months: 10000
+tracking:
+  mlflow:
+    experiment_name: santander-acquisition-only-original-v1
+  gcs:
+    bucket: null
+    prefix: model-runs

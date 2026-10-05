@@ -6,6 +6,9 @@ pipeline:
 
 data:
   interim_train: interim/train.parquet
+  # Shared, model-agnostic customer-month checkpoint.  Persona/history groups
+  # extend this file before a model-specific panel is made.
+  feature_store: processed/customer_month_features.parquet
   model_panel: processed/lightgbm_v2/model_panel_history_persona.parquet
   artifact_dir: artifacts
 
@@ -44,7 +47,7 @@ model:
   # is equivalent to min(500k, 1M - positive_samples).
   max_negative_rows_per_product: 50000
   # Hard upper bound for positives plus negatives in each product model.
-  max_total_rows_per_product: 100000
+  max_total_rows_per_product: 1000000
 
 runtime:
   memory_limit: 4GB

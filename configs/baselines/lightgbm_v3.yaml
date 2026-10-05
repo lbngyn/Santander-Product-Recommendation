@@ -7,6 +7,7 @@ pipeline:
 
 data:
   interim_train: interim/train.parquet
+  feature_store: processed/customer_month_features.parquet
   model_panel: processed/lightgbm_v3/model_panel_persona_history.parquet
   artifact_dir: artifacts
 

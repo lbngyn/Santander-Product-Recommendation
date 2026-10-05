@@ -66,11 +66,15 @@ Whenever a memory optimization is introduced, update the README with:
 
 ## Feature Engineering
 
+- Acquisition defaults to a `0 -> 1` transition against the nearest previous observed customer record, including calendar gaps. Do not require `record_gap_months = 1` unless explicitly requested. A first record has no observed transition. Keep `record_gap_months` for diagnostics. This rule also applies to RFM history, model labels, training selection, and evaluation.
+- The canonical pipeline owns the approved RFM income preprocessing (`customer_history_geo_median_v1`): observed, past fill, guarded backward fill (population persistence >= 99%, customer <= 1 distinct income), customer-median geographic fallback, then global customer median. RFM and CLV consume `renta_filled` and `renta_imputation_method` without preprocessing again. This is an offline proxy rule; retain `renta_raw` for provenance.
+
 - Put reusable feature engineering code in `src/features/`; notebooks should import and call these modules rather than duplicate implementation logic.
 - Persist feature/preprocessing outputs to the canonical datasets `processed/train.parquet` and `processed/test.parquet`. Preserve unrelated columns and never overwrite raw/source data.
 - Feature functions must support `force_process: bool = False`, scoped only to the feature or feature group owned by that function.
 - With `force_process=False`, check the canonical dataset: if all target columns exist, skip processing; otherwise compute the missing targets and persist the update.
 - With `force_process=True`, recompute and overwrite only the function's target columns, preserving unrelated features.
+- The canonical pipeline supports explicit `force_features` and `force_functions` selections, mapped through `PIPELINE_FUNCTION_OUTPUTS`. Global `force_process=True` forces all functions; otherwise selected owners, functions missing outputs, and their downstream consumers run. Selecting a feature forces its entire owning function contract. Preserve other feature values and retained checkpoint versions. Propagate downstream invalidation from RUN outputs through declared required_inputs in pipeline order. Code changes are not detected automatically; callers select the affected starting functions, including consumers of modified shared helpers.
 - Column existence is the only freshness check. Do not add versioning, hashes, timestamps, dependency fingerprints, or other invalidation mechanisms unless explicitly requested.
 
 ## Working Principles

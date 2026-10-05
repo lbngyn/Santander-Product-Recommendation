@@ -10,4 +10,5 @@ hydra-core
 mlflow
 dvc
 lightgbm
+scikit-learn
 pymc-marketing

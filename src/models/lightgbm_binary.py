@@ -13,10 +13,11 @@ from typing import Any, Mapping, Sequence
 import duckdb
 import pandas as pd
 
+from src.features.contracts import exclude_eda_only_features
 from src.inference.predict import InputSchema, ModelArtifact, write_artifact_metadata
 
 
-MODEL_METADATA_COLUMNS = {"ncodpers", "fecha_dato", "previous_observation"}
+MODEL_METADATA_COLUMNS = {"ncodpers", "fecha_dato", "previous_observation", "rfm_has_previous_record"}
 
 
 def train_product_classifiers(
@@ -39,7 +40,7 @@ def train_product_classifiers(
     temp_directory: str | Path | None = None,
     lightgbm_params: Mapping[str, Any] | None = None,
     training_log_period: int = 5,
-    require_adjacent_month: bool = True,
+    require_adjacent_month: bool = False,
     categorical_feature_names: Sequence[str] | None = None,
 ) -> dict[str, str]:
     """Fit 24 independent classifiers using only customers unowned at t-1.
@@ -78,7 +79,10 @@ def train_product_classifiers(
         products = [product for product in all_products if product in requested_products]
         if not products:
             raise ValueError("At least one product must be selected for training.")
-        default_features = [c for c in columns if c not in { *MODEL_METADATA_COLUMNS, *["acq_" + p for p in all_products]} and not c.startswith("sampled_for_")]
+        default_features = exclude_eda_only_features(
+            c for c in columns
+            if c not in MODEL_METADATA_COLUMNS and not c.startswith("sampled_for_")
+        )
         selected = list(feature_names or default_features)
         forbidden = set(selected).intersection(MODEL_METADATA_COLUMNS)
         if forbidden:
@@ -102,9 +106,8 @@ def train_product_classifiers(
         if max_total_rows_per_product is not None and max_total_rows_per_product <= 0:
             raise ValueError("max_total_rows_per_product must be positive when set.")
         for model_number, product in enumerate(products, start=1):
-            # Eligibility is product-specific and only admits an observed
-            # adjacent-month 0 -> {0,1} transition.  A gap cannot safely be
-            # interpreted as a monthly non-acquisition.
+            # Eligibility is product-specific and requires a preceding record.
+            # Calendar gaps are included unless adjacency is explicitly requested.
             # Materialise exactly the types LightGBM needs.  DuckDB otherwise
             # returns most numerics as float64 / int64, doubling DataFrame RAM.
             projection = ", ".join(
@@ -120,7 +123,8 @@ def train_product_classifiers(
             label_name = "acq_" + product
             label_projection = f"CAST({_quote(label_name)} AS TINYINT) AS {_quote(label_name)}"
             projection = f"{projection}, {label_projection}"
-            transition_filter = "record_gap_months = 1 AND " if require_adjacent_month else "previous_observation = 1 AND "
+            previous_record_column = "rfm_has_previous_record" if "rfm_has_previous_record" in columns else "previous_observation"
+            transition_filter = "record_gap_months = 1 AND " if require_adjacent_month else f"{previous_record_column} = 1 AND "
             eligibility = f'{transition_filter}COALESCE({_quote("prev_" + product)}, 0) = 0'
             if train_before_date is not None:
                 cutoff = train_before_date.replace("'", "''")

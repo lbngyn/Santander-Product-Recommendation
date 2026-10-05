@@ -7,6 +7,7 @@ from typing import Sequence
 import duckdb
 
 from src.features.customer_history import HISTORY_FEATURE_NAMES, product_event_count_sql
+from src.features.rfm import rfm_acquisition_count_sql
 from src.features.persona import (
     PERSONA_FEATURES,
     persona_feature_projection_sql,
@@ -65,7 +66,14 @@ def materialize_competition_test_input(
             f"CAST(COALESCE(history.{q(product)}, 0) AS TINYINT) AS {q('prev_' + product)}"
             for product in product_names
         )
-        owned_count = " + ".join(f"COALESCE(history.{q(product)}, 0)" for product in product_names)
+        monetary_known = " + ".join(
+            f"CASE WHEN TRY_CAST(history.{q(product)} AS INTEGER) IN (0, 1) THEN 1 ELSE 0 END"
+            for product in product_names
+        )
+        monetary_owned = " + ".join(
+            f"CASE WHEN TRY_CAST(history.{q(product)} AS INTEGER) = 1 THEN 1 ELSE 0 END"
+            for product in product_names
+        )
         previous_raw = ", ".join(
             f"LAG({q(product)}) OVER customer_time AS {q('previous_' + product)}" for product in product_names
         )
@@ -110,34 +118,37 @@ def materialize_competition_test_input(
                     FROM ordered
                 ), events AS (
                     SELECT *, {acquisition_events} AS acquisition_events, {drop_events} AS drop_events FROM transitions
+                ), rfm_events AS (
+                    SELECT *, {rfm_acquisition_count_sql(product_names)} AS rfm_n_acquisition FROM events
                 ), latest_history AS (
                     SELECT * EXCLUDE (row_number) FROM (
-                        SELECT *, ROW_NUMBER() OVER (PARTITION BY ncodpers ORDER BY fecha_dato DESC) AS row_number FROM events
+                        SELECT *, ROW_NUMBER() OVER (PARTITION BY ncodpers ORDER BY fecha_dato DESC) AS row_number FROM rfm_events
                     ) WHERE row_number = 1
                 ), history_summary AS (
-                    SELECT ncodpers, COUNT(*) AS customer_history_length,
-                           COALESCE(SUM(acquisition_events), 0) AS cumulative_acquisitions,
+                    SELECT ncodpers, COUNT(*) AS rfm_observed_history_records,
+                           COALESCE(SUM(COALESCE(rfm_n_acquisition, 0)), 0) AS rfm_frequency,
                            COALESCE(SUM(drop_events), 0) AS cumulative_drops,
-                           MAX(CASE WHEN acquisition_events > 0 THEN CAST(fecha_dato AS DATE) END) AS last_acquisition_date
-                    FROM events GROUP BY ncodpers
+                           MAX(CASE WHEN rfm_n_acquisition > 0 THEN CAST(fecha_dato AS DATE) END) AS rfm_last_acquisition_date
+                    FROM rfm_events GROUP BY ncodpers
                 ), recent_acquisitions AS (
                     SELECT test.ncodpers,
                            COALESCE(SUM(CASE WHEN CAST(events.fecha_dato AS DATE) >= CAST(test.fecha_dato AS DATE) - INTERVAL 1 MONTH THEN events.acquisition_events ELSE 0 END), 0) AS acquisitions_last_1m,
                            COALESCE(SUM(CASE WHEN CAST(events.fecha_dato AS DATE) >= CAST(test.fecha_dato AS DATE) - INTERVAL 3 MONTH THEN events.acquisition_events ELSE 0 END), 0) AS acquisitions_last_3m,
                            COALESCE(SUM(CASE WHEN CAST(events.fecha_dato AS DATE) >= CAST(test.fecha_dato AS DATE) - INTERVAL 6 MONTH THEN events.acquisition_events ELSE 0 END), 0) AS acquisitions_last_6m
                     FROM test_rows AS test
-                    LEFT JOIN events ON test.ncodpers = events.ncodpers
+                    LEFT JOIN rfm_events AS events ON test.ncodpers = events.ncodpers
                         AND CAST(events.fecha_dato AS DATE) < CAST(test.fecha_dato AS DATE)
                     GROUP BY test.ncodpers
                 )
                 SELECT test.ncodpers, test.fecha_dato{', ' if profiles else ''}{profiles}, {previous}
                        , CAST(date_diff('month', CAST(history.fecha_dato AS DATE), CAST(test.fecha_dato AS DATE)) AS INTEGER) AS record_gap_months
-                       , CAST(COALESCE(summary.customer_history_length, 0) AS INTEGER) AS customer_history_length
-                       , CAST(COALESCE({owned_count}, 0) AS TINYINT) AS products_owned_count
-                       , CAST(COALESCE(summary.cumulative_acquisitions, 0) AS INTEGER) AS cumulative_acquisitions
+                       , CAST(history.ncodpers IS NOT NULL AS TINYINT) AS rfm_has_previous_record
+                       , CAST(date_diff('month', summary.rfm_last_acquisition_date, CAST(test.fecha_dato AS DATE)) AS INTEGER) AS rfm_recency_months
+                       , CAST(summary.rfm_last_acquisition_date IS NULL AS TINYINT) AS rfm_never_acquired_before
+                       , CAST(COALESCE(summary.rfm_frequency, 0) AS INTEGER) AS rfm_frequency
+                       , CAST(CASE WHEN history.ncodpers IS NOT NULL AND ({monetary_known}) > 0 THEN ({monetary_owned}) ELSE NULL END AS INTEGER) AS rfm_monetary
+                       , CAST(COALESCE(summary.rfm_observed_history_records, 0) AS INTEGER) AS rfm_observed_history_records
                        , CAST(COALESCE(summary.cumulative_drops, 0) AS INTEGER) AS cumulative_drops
-                       , CAST(date_diff('month', summary.last_acquisition_date, CAST(test.fecha_dato AS DATE)) AS INTEGER) AS months_since_last_acquisition
-                       , CAST(summary.last_acquisition_date IS NULL AS TINYINT) AS never_acquired_before
                        , CAST(COALESCE(recent.acquisitions_last_1m, 0) AS INTEGER) AS acquisitions_last_1m
                        , CAST(COALESCE(recent.acquisitions_last_3m, 0) AS INTEGER) AS acquisitions_last_3m
                        , CAST(COALESCE(recent.acquisitions_last_6m, 0) AS INTEGER) AS acquisitions_last_6m

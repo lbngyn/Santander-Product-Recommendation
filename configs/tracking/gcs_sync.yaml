@@ -1,0 +1,5 @@
+project_id: santander-product-recommendation
+bucket: null  # falls back to GCS_BUCKET from .env
+prefix: model-runs
+host_root: data/tracking_host
+port: 5000
