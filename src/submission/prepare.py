@@ -196,3 +196,82 @@ def _configure_duckdb(con: duckdb.DuckDBPyConnection, memory_limit: str | None, 
 
 def _quote(value: str) -> str:
     return '"' + value.replace('"', '""') + '"'
+
+
+def materialize_acquisition_only_test_input(test, history, destination, runtime, work):
+    """Clean June profiles using historical residuals and the shared income rule.
+
+    Canonical history is preserved. Only observations before June enter profile
+    fills and previous ownership. Unknown customers have zero previous ownership.
+    June income uses the same un-clipped RFM rule as canonical preprocessing.
+    """
+    from src.features.acquisition_only import _copy
+    from src.features.acquisition_only_contract import DATES, KEYS, NUMERIC, PROFILES, parquet, quote
+    from src.products import PRODUCT_COLUMNS
+    from src.utils.modeling_runtime import connection
+    from src.preprocessing.customer_profile import (
+        fit_baseline_profile_preprocessing, transform_customer_profiles_past_only,
+    )
+    from src.preprocessing.renta_monetary import preprocess_renta_monetary
+
+    test, history, destination, work = map(Path, (test, history, destination, work))
+    work.mkdir(parents=True, exist_ok=True)
+    historical = work / "history_before_june.parquet"
+    raw_test = work / "june_profiles_raw.parquet"
+    clean_test = work / "june_profiles_clean.parquet"
+    income_source = work / "income_source.parquet"
+    income = work / "income_filled.parquet"
+    with connection(runtime, work) as con:
+        for source, required in ((test, [*KEYS, *PROFILES]),
+                                 (history, [*KEYS, *PROFILES, *PRODUCT_COLUMNS])):
+            columns = {r[0] for r in con.execute(f"DESCRIBE SELECT * FROM {parquet(source)}").fetchall()}
+            if missing := set(required) - columns:
+                raise ValueError(f"Missing inference source columns in {source}: {sorted(missing)}")
+        invalid = con.execute(f"SELECT count(*) = 0 OR count(*) != count(DISTINCT ncodpers) "
+                              f"OR count(*) != count(ncodpers) OR count(*) != count(fecha_dato) "
+                              f"OR count(*) FILTER (WHERE CAST(fecha_dato AS DATE) < DATE '2016-06-01' "
+                              f"OR CAST(fecha_dato AS DATE) >= DATE '2016-07-01') > 0 FROM {parquet(test)}").fetchone()[0]
+        if invalid:
+            raise ValueError("Test input requires unique non-null customers and June-2016 dates")
+        history_columns = {r[0] for r in con.execute(f"DESCRIBE SELECT * FROM {parquet(history)}").fetchall()}
+        names = [*KEYS, *PROFILES, *PRODUCT_COLUMNS]
+        if "renta_raw" in history_columns:
+            names.append("renta_raw")
+        _copy(con, f"SELECT {', '.join(map(quote, names))} FROM {parquet(history)} "
+                   "WHERE CAST(fecha_dato AS DATE) < DATE '2016-06-01'", historical)
+        _copy(con, f"SELECT {', '.join(map(quote, [*KEYS, *PROFILES]))} FROM {parquet(test)}", raw_test)
+    # Categories/dates use the shared past-only cleaning. Numeric residuals are
+    # fitted on the pinned canonical history, never on the June population.
+    stats = fit_baseline_profile_preprocessing(historical)
+    transform_customer_profiles_past_only(
+        raw_test, clean_test, stats, history_path=historical,
+        memory_limit=runtime.get("memory_limit"), temp_directory=work / "profile_spill",
+    )
+    with connection(runtime, work) as con:
+        renta = "renta_raw" if "renta_raw" in history_columns else "renta"
+        # The income rule reads original income, rather than a residual filled
+        # by the profile cleaner; other profile columns remain cleaned.
+        _copy(con, f"SELECT ncodpers, fecha_dato, {quote(renta)} AS renta, cod_prov, pais_residencia "
+                   f"FROM {parquet(historical)} UNION ALL BY NAME "
+                   f"SELECT ncodpers, fecha_dato, renta, cod_prov, pais_residencia FROM {parquet(raw_test)}", income_source)
+    preprocess_renta_monetary(income_source, income, memory_limit=runtime.get("memory_limit"),
+                             temp_directory=work / "income_spill")
+    profiles = []
+    for name in PROFILES:
+        value = "i.renta_filled" if name == "renta" else f"t.{quote(name)}"
+        if name in NUMERIC:
+            expression = f"TRY_CAST({value} AS FLOAT)"
+        elif name in DATES:
+            expression = f"CAST(date_diff('day', DATE '1970-01-01', TRY_CAST({value} AS DATE)) AS FLOAT)"
+        else:
+            expression = f"COALESCE(CAST({value} AS VARCHAR), '__MISSING__')"
+        profiles.append(f"{expression} AS {quote(name)}")
+    previous = [f"COALESCE(TRY_CAST(h.{quote(p)} AS TINYINT), 0) AS {quote('prev_' + p)}"
+                for p in PRODUCT_COLUMNS]
+    with connection(runtime, work) as con:
+        _copy(con, f"WITH latest AS (SELECT * FROM {parquet(historical)} "
+                   "QUALIFY ROW_NUMBER() OVER (PARTITION BY ncodpers ORDER BY fecha_dato DESC) = 1) "
+                   f"SELECT t.ncodpers, t.fecha_dato, {', '.join([*profiles, *previous])} "
+                   f"FROM {parquet(clean_test)} t JOIN {parquet(income)} i USING (ncodpers, fecha_dato) "
+                   "LEFT JOIN latest h USING (ncodpers) ORDER BY t.ncodpers", destination)
+    return destination

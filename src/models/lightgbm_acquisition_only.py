@@ -6,13 +6,15 @@ import pickle
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import pyarrow as pa
 import pyarrow.csv as pacsv
 
 from src.features.acquisition_only_contract import matrix, model_frame, paired_batches
 from src.utils.modeling_runtime import Measurement
 from src.utils.run_files import read_json, write_json
-from src.inference.predict import InputSchema, ModelArtifact, write_artifact_metadata
+from src.inference.predict import InputSchema, ModelArtifact, load_artifact, predict, write_artifact_metadata
+from src.tracking.run_bundle import safe_file
 from src.products import PRODUCT_COLUMNS
 
 
@@ -24,6 +26,48 @@ class BaselineBooster:
     def predict_proba(self, frame):
         scores = np.asarray(self.booster.predict(matrix(model_frame(frame, self.contract, self.joint))))
         return np.column_stack((1 - scores, scores))
+
+
+def candidate_batch_scorer(run):
+    """Adapt saved independent/joint models to the shared submission scorer."""
+    run = Path(run)
+    result = read_json(run / "run_result.json")
+    contract = read_json(run / "feature_contract.json")
+    index = read_json(run / "model_index.json")
+    joint = result["approach"] == "joint"
+    expected = {"joint_model"} if joint else set(PRODUCT_COLUMNS)
+    if set(index) != expected:
+        raise ValueError("Incomplete model index")
+    loaded = {}
+    for key, relative in index.items():
+        artifact, model = load_artifact(safe_file(run, relative))
+        expected_product = "__joint_product_candidate__" if joint else key
+        if artifact.product != expected_product or model.contract != contract or model.joint != joint:
+            raise ValueError("Model identity or feature contract differs from run")
+        loaded[key] = (artifact, model)
+
+    def score_batch(inputs):
+        candidates = []
+        for product_id, product in enumerate(PRODUCT_COLUMNS):
+            previous = inputs["prev_" + product]
+            if not previous.isin([0, 1]).all():
+                raise ValueError("Previous ownership must be binary and non-null")
+            eligible = previous.eq(0)
+            if not eligible.any():
+                continue
+            frame = inputs.loc[eligible].copy()
+            if joint:
+                frame["product_id"] = product_id
+            artifact, model = loaded["joint_model" if joint else product]
+            probabilities = predict(model_frame(frame, contract, joint), artifact, model).to_numpy()
+            if not np.isfinite(probabilities).all() or ((probabilities < 0) | (probabilities > 1)).any():
+                raise ValueError("Invalid candidate probabilities")
+            candidates.append(pd.DataFrame({"ncodpers": frame.ncodpers.to_numpy(),
+                                            "product": product, "score": probabilities}))
+        return (pd.concat(candidates, ignore_index=True) if candidates
+                else pd.DataFrame(columns=["ncodpers", "product", "score"]))
+
+    return score_batch
 
 
 def _write_candidates(dataset, contract, products, joint, destination, batch_size):

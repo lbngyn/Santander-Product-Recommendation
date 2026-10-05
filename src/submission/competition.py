@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Callable, Mapping
+from typing import Callable, Mapping, Sequence
 
 import pandas as pd
 import numpy as np
@@ -22,6 +22,7 @@ def run_ranked_candidate_submission(
     top_k: int = 7,
     batch_customers: int = 50_000,
     customer_id_column: str = "ncodpers",
+    product_order: Sequence[str] | None = None,
 ) -> Path:
     """Write the official submission from a small model-specific scorer.
 
@@ -29,10 +30,14 @@ def run_ranked_candidate_submission(
     model-ready customer batch and returns ``ncodpers``, ``product`` and
     numeric ``score`` candidate rows. This module owns ranking, template
     ordering, column validation and CSV output for every model strategy.
+    ``product_order`` optionally supplies the tie order used by validation;
+    omitted, ties retain the existing alphabetical product order.
     """
     if top_k < 1 or batch_customers < 1:
         raise ValueError("top_k and batch_customers must be positive.")
-    if customer_id_column not in prepared_input or prepared_input[customer_id_column].duplicated().any():
+    if (prepared_input.empty or customer_id_column not in prepared_input
+            or prepared_input[customer_id_column].isna().any()
+            or prepared_input[customer_id_column].duplicated().any()):
         raise ValueError("Prepared competition input must contain exactly one row per ncodpers.")
     scored_batches: list[pd.DataFrame] = []
     for start in range(0, len(prepared_input), batch_customers):
@@ -48,7 +53,16 @@ def run_ranked_candidate_submission(
             raise ValueError("Candidate scorer emitted a non-finite score.")
         scored_batches.append(scored)
     candidates = pd.concat(scored_batches, ignore_index=True) if scored_batches else pd.DataFrame(columns=[customer_id_column, "product", "score"])
-    ranked = candidates.sort_values([customer_id_column, "score", "product"], ascending=[True, False, True], kind="stable")
+    tie_column = "product"
+    if product_order is not None:
+        order = {product: i for i, product in enumerate(product_order)}
+        if len(order) != len(product_order):
+            raise ValueError("product_order must contain unique product names.")
+        candidates["product_order"] = candidates["product"].map(order)
+        if candidates["product_order"].isna().any():
+            raise ValueError("Candidate product is absent from product_order.")
+        tie_column = "product_order"
+    ranked = candidates.sort_values([customer_id_column, "score", tie_column], ascending=[True, False, True], kind="stable")
     ranked["rank"] = ranked.groupby(customer_id_column, sort=False).cumcount().add(1)
     recommendations = (
         ranked.loc[ranked["rank"].le(top_k)]
@@ -61,7 +75,7 @@ def run_ranked_candidate_submission(
         template = pd.read_csv(sample_submission_path)
         if list(template.columns) != [customer_id_column, "added_products"]:
             raise ValueError("sample_submission must contain exactly ncodpers and added_products in that order.")
-        if template[customer_id_column].duplicated().any():
+        if template[customer_id_column].isna().any() or template[customer_id_column].duplicated().any():
             raise ValueError("sample_submission must contain one row per ncodpers.")
     output = template.loc[:, [customer_id_column]].merge(
         recommendations, on=customer_id_column, how="left", sort=False, validate="one_to_one",
@@ -73,7 +87,9 @@ def run_ranked_candidate_submission(
     output["added_products"] = output["added_products"].fillna("")
     destination = Path(output_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    output.to_csv(destination, index=False)
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    output.to_csv(temporary, index=False)
+    temporary.replace(destination)
     return destination
 
 

@@ -167,3 +167,56 @@ def comparison(run_a, run_b):
                      "train_seconds": train["duration_seconds"], "train_peak_rss_bytes": train["peak_rss_bytes"],
                      "model_size_bytes": train["model_size_bytes"], "number_of_models": train["number_of_models"]})
     return pd.DataFrame(rows)
+
+
+def create_submission(run, *, data_root, work_root, raw_test=None, sample_submission=None, history_path=None):
+    """Prepare June input and write submission outside the immutable run/bundle."""
+    from src.ingestion.checkpoint import build_interim_checkpoint
+    from src.submission.prepare import materialize_acquisition_only_test_input
+    from src.submission.competition import run_ranked_candidate_submission
+    from src.utils.run_files import sha256
+    from src.products import PRODUCT_COLUMNS
+
+    run, root, work_root = map(lambda p: Path(p).resolve(), (run, data_root, work_root))
+    result = read_json(run / "run_result.json")
+    if result["status"] != "FINISHED" or not result.get("inference_ready"):
+        raise ValueError("Submission requires a FINISHED, inference-ready run")
+    config = yaml.safe_load((run / "config_resolved.yaml").read_text(encoding="utf-8"))
+    manifest = read_json(run / "dataset_manifest.json")
+    history = Path(history_path or manifest["checkpoint_path"])
+    if not history.is_file() or sha256(history) != manifest["checkpoint_sha256"]:
+        raise ValueError("Pinned canonical history missing or changed; supply history_path with the same checksum")
+    if read_json(run / "feature_contract.json") != manifest["feature_contract"]:
+        raise ValueError("Run feature contract differs from the trained dataset")
+    from src.tracking.run_bundle import safe_id
+    run_id = safe_id(result["source_run_id"])
+    work = work_root / run_id / "submission"
+    work.mkdir(parents=True, exist_ok=True)
+    raw = Path(raw_test) if raw_test is not None else root / "raw/test_ver2.csv"
+    template = Path(sample_submission) if sample_submission is not None else root / "raw/sample_submission.csv"
+    if not template.is_file():
+        raise FileNotFoundError(f"Official sample_submission template not found: {template}")
+    # A run-specific fresh checkpoint prevents reuse of an unrelated/stale test.
+    test = work / "test.parquet"
+    build_interim_checkpoint(raw, test, chunksize=int(config["runtime"]["batch_customer_months"]),
+                             force_rebuild=True, show_progress=True)
+    prepared = materialize_acquisition_only_test_input(test, history, work / "prepared_june.parquet", config["runtime"], work)
+    output = root / "artifacts/submissions" / run_id / "submission.csv"
+    inputs = pd.read_parquet(prepared)
+    run_ranked_candidate_submission(
+        inputs, template, output, score_batch=models.candidate_batch_scorer(run),
+        batch_customers=int(config["runtime"]["batch_customer_months"]),
+        top_k=7, product_order=PRODUCT_COLUMNS,
+    )
+    write_json(output.parent / "submission_manifest.json", {
+        "source_run_id": run_id, "approach": result["approach"], "created_at": now(),
+        "run": str(run), "history": str(history), "history_sha256": manifest["checkpoint_sha256"],
+        "raw_test": str(raw), "raw_test_sha256": sha256(raw),
+        "sample_submission": str(template), "sample_submission_sha256": sha256(template),
+        "feature_contract_sha256": sha256(run / "feature_contract.json"),
+        "prepared_input": str(prepared), "submission_sha256": sha256(output), "top_k": 7,
+        "tie_break": "canonical_product_order", "unknown_customer_ownership": "all_unowned",
+        "profile_residuals": "pinned_canonical_history_medians",
+        "income_policy": "shared_customer_history_geo_median_v1_without_clipping",
+    })
+    return output

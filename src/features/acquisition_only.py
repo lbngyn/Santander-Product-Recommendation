@@ -47,7 +47,11 @@ def preview(config, data_root, work):
     existing = output / "dataset_manifest.json"
     if existing.is_file():
         manifest = read_json(existing); _check_config(config, manifest)
-        return {"action": "reuse_pinned_dataset", "dataset": str(output), "manifest": manifest}
+        return {"action": "reuse_pinned_dataset", "dataset": str(output), "manifest": manifest,
+                "checkpoint_version": manifest["checkpoint_version"],
+                "checkpoint": manifest["checkpoint_path"],
+                "feature_names": manifest["feature_contract"]["feature_names"],
+                "acquisition_count_column": manifest.get("acquisition_count_column")}
     source, version = resolve_checkpoint(data_root, config["data"].get("checkpoint_version"))
     with connection(config["runtime"], work) as con:
         schema = {r[0] for r in con.execute(f"DESCRIBE SELECT * FROM {parquet(source)}").fetchall()}
