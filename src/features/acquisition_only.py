@@ -107,7 +107,7 @@ def prepare(config, data_root, work):
         projection = ", ".join([*KEYS, *profiles, *states, *extras])
         previous = ", ".join(f"LAG({quote(p)}) OVER customer_time AS {quote('prev_' + p)}" for p in PRODUCT_COLUMNS)
         labels = ", ".join(
-            (f"CAST({quote('stored_' + c)} AS TINYINT)" if stored_labels else acquisition_label_sql(p, previous_prefix="prev_")) + f" AS {quote(c)}"
+            (f"CAST({_stored_label_sql('stored_' + c)} AS TINYINT)" if stored_labels else acquisition_label_sql(p, previous_prefix="prev_")) + f" AS {quote(c)}"
             for p, c in zip(PRODUCT_COLUMNS, LABELS)
         )
         label_sum = " + ".join(quote(c) for c in LABELS)
@@ -118,11 +118,11 @@ def prepare(config, data_root, work):
         )"""
         if stored_labels:
             disagreements = " OR ".join(
-                f"TRY_CAST({quote('stored_' + c)} AS DOUBLE) IS NULL OR TRY_CAST({quote('stored_' + c)} AS DOUBLE) != ({acquisition_label_sql(p, previous_prefix='prev_')})"
+                f"({_stored_label_sql('stored_' + c)}) IS NULL OR ({_stored_label_sql('stored_' + c)}) != ({acquisition_label_sql(p, previous_prefix='prev_')})"
                 for p, c in zip(PRODUCT_COLUMNS, LABELS)
             )
             if con.execute(f"{history_query} SELECT COUNT(*) FROM history WHERE CAST(fecha_dato AS DATE) < DATE '{end}' AND ({disagreements})").fetchone()[0]:
-                raise ValueError("Canonical acquisition labels disagree with nearest previous observed record")
+                raise ValueError("Canonical acquisition labels disagree with nearest previous observed record (first-record NULL labels are accepted)")
         query = f"""{history_query}, events AS (SELECT *, {labels} FROM history)
         SELECT {', '.join(quote(c) for c in [*KEYS, *FEATURES, *LABELS])},
                record_gap_months, {count} AS n_acquisitions
@@ -166,6 +166,16 @@ def prepare(config, data_root, work):
         "labels_source": "canonical_acq_columns" if stored_labels else "nearest_record_transitions",
         "created_at": now(), "files": files, "audit": audit, "feature_contract": contract})
     return output
+
+
+def _stored_label_sql(column):
+    """First observations may have undefined labels; later NULL is invalid.
+
+    Normalize only that no-history sentinel in the temporary modeling timeline.
+    First observations are excluded from both splits; the checkpoint is untouched.
+    """
+    name = quote(column)
+    return f"CASE WHEN record_gap_months IS NULL AND {name} IS NULL THEN 0 ELSE TRY_CAST({name} AS DOUBLE) END"
 
 
 def _copy(con, query, destination):
