@@ -24,7 +24,8 @@ class BaselineBooster:
         self.booster, self.contract, self.joint = booster, contract, joint
 
     def predict_proba(self, frame):
-        scores = np.asarray(self.booster.predict(matrix(model_frame(frame, self.contract, self.joint))))
+        scores = np.asarray(self.booster.predict(matrix(model_frame(frame, self.contract, self.joint)),
+            num_threads=int(self.booster.params.get('num_threads', 1))))
         return np.column_stack((1 - scores, scores))
 
 
@@ -111,6 +112,7 @@ def train(dataset, run_dir, config, work):
     index, all_metrics = {}, {}
     with Measurement() as total:
         for name, products in jobs:
+            print(f'[train {len(index) + 1}/{len(jobs)}] {name}', flush=True)
             directory = run_dir / ("joint_model" if joint else f"models/{name}")
             directory.mkdir(parents=True, exist_ok=True)
             text = work / f"{name}.csv"
@@ -118,15 +120,28 @@ def train(dataset, run_dir, config, work):
                 rows, positives = _write_candidates(dataset, contract, products, joint, text, int(config["runtime"]["batch_customer_months"]))
                 import time
                 began = time.perf_counter()
-                params = {"two_round": True, "max_bin": int(config["model"]["lightgbm_params"].get("max_bin", 255)), "header": False, "label_column": 0,
+                params = {**config['model']['lightgbm_params'], "two_round": True, "max_bin": int(config["model"]["lightgbm_params"].get("max_bin", 255)), "header": False, "label_column": 0,
                           "num_threads": int(config["runtime"]["threads"])}
                 native = lgb.Dataset(str(text), feature_name=[f"f{i}" for i in range(len(names))], categorical_feature=categorical_indices, params=params, free_raw_data=True)
                 native.construct()
                 construct_seconds = time.perf_counter() - began
                 began = time.perf_counter()
-                booster = lgb.train({**config["model"]["lightgbm_params"], "objective": "binary", "seed": int(config["model"]["random_state"]),
-                                     "num_threads": int(config["runtime"]["threads"])}, native,
-                                    num_boost_round=int(config["model"]["n_estimators"]))
+                history = {}
+                record_training = bool(config['model'].get('record_training_metrics', False))
+                train_params = {**config["model"]["lightgbm_params"], "objective": "binary", "seed": int(config["model"]["random_state"]),
+                                "num_threads": int(config["runtime"]["threads"])}
+                evaluation = {}
+                if record_training:
+                    train_params['metric'] = ['binary_logloss', 'auc']
+                    evaluation = dict(valid_sets=[native], valid_names=['train'],
+                        callbacks=[lgb.record_evaluation(history), lgb.log_evaluation(int(config['model'].get('training_log_period', 20)))])
+                try:
+                    booster = lgb.train(train_params, native,
+                        num_boost_round=int(config["model"]["n_estimators"]), **evaluation)
+                finally:
+                    if record_training:
+                        write_json(directory / 'training_history.json', {'scope': 'training_candidates_only',
+                            'iteration_start': 1, 'metrics': history.get('train', {})})
                 fit_seconds = time.perf_counter() - began
                 booster.free_dataset()
                 model = BaselineBooster(booster, contract, joint)
@@ -142,6 +157,8 @@ def train(dataset, run_dir, config, work):
             metrics = {**stage.metrics(), "eligible_rows": rows, "acquisitions": positives,
                        "negative_rows": rows - positives, "construct_seconds": construct_seconds, "fit_seconds": fit_seconds,
                        "model_size_bytes": (directory / "model.pkl").stat().st_size}
+            if record_training:
+                metrics.update({'train_' + key: values[-1] for key, values in history.get('train', {}).items() if values})
             write_json(directory / "training_metrics.json", metrics)
             index[name] = directory.relative_to(run_dir).as_posix(); all_metrics[name] = metrics
             write_json(run_dir / "model_index.json", index)  # retain completed products if a later model fails

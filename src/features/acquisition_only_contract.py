@@ -32,7 +32,10 @@ def model_frame(frame, contract, joint=False):
     result = frame.loc[:, names].copy()
     for name in names:
         if name in contract["category_values"]:
-            result[name] = pd.Categorical(result[name], categories=contract["category_values"][name])
+            categories = contract['category_values'][name]
+            # Explicit unknown-to-missing conversion also works with newer Pandas.
+            values = result[name].where(result[name].isin(categories))
+            result[name] = pd.Categorical(values, categories=categories)
         elif name == "product_id":
             result[name] = pd.Categorical(result[name], categories=list(range(len(PRODUCT_COLUMNS))))
         else:

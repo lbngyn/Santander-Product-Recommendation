@@ -36,9 +36,10 @@ class ProcessingStep:
 class CheckpointStore:
     """Persist and resolve immutable full customer-month checkpoint versions."""
 
-    def __init__(self, root: str | Path) -> None:
+    def __init__(self, root: str | Path, *, runtime: Mapping[str, Any] | None = None) -> None:
         self.root = Path(root)
         self.manifest_path = self.root / MANIFEST_NAME
+        self.runtime = dict(runtime or {})
 
     def resolve(
         self,
@@ -89,9 +90,9 @@ class CheckpointStore:
                 target = version_dir / f"{name}.parquet"
                 shutil.copy2(candidate, target)
                 retained[name] = target
-            artifact_metadata = {name: _artifact_metadata(path) for name, path in retained.items()}
+            artifact_metadata = {name: _artifact_metadata(path, self.runtime) for name, path in retained.items()}
             for name, metadata in artifact_metadata.items():
-                _validate_artifact(retained[name], metadata["schema"])
+                _validate_artifact(retained[name], metadata["schema"], self.runtime)
             feature_sets = [set(metadata["schema"]) for metadata in artifact_metadata.values()]
             shared_features = sorted(set.intersection(*feature_sets)) if feature_sets else []
             parent = next((v for v in manifest["versions"] if v["version"] == parent_version), None)
@@ -156,7 +157,7 @@ class CheckpointStore:
         try:
             for artifact in version.get("artifacts", {}).values():
                 path = self.root / artifact["path"]
-                _validate_artifact(path, artifact["schema"])
+                _validate_artifact(path, artifact["schema"], self.runtime)
         except (OSError, ValueError, duckdb.Error, KeyError):
             return False
         return True
@@ -299,9 +300,9 @@ def _shared_columns(artifacts: Mapping[str, Path]) -> set[str]:
     return set.intersection(*(set(schema) for schema in schemas))
 
 
-def _artifact_metadata(path: Path) -> dict[str, Any]:
-    schema = _schema(path)
-    con = duckdb.connect(database=":memory:")
+def _artifact_metadata(path: Path, runtime: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    schema = _schema(path, runtime)
+    con = _checkpoint_connection(runtime)
     try:
         rows, minimum, maximum = con.execute(
             "SELECT COUNT(*), MIN(CAST(fecha_dato AS DATE)), MAX(CAST(fecha_dato AS DATE)) FROM read_parquet(?)",
@@ -312,15 +313,15 @@ def _artifact_metadata(path: Path) -> dict[str, Any]:
     return {"schema": schema, "row_count": int(rows), "date_coverage": {"min": str(minimum) if minimum else None, "max": str(maximum) if maximum else None}}
 
 
-def _validate_artifact(path: Path, expected_schema: Mapping[str, str]) -> None:
+def _validate_artifact(path: Path, expected_schema: Mapping[str, str], runtime: Mapping[str, Any] | None = None) -> None:
     if not path.is_file():
         raise ValueError(f"Checkpoint artifact does not exist: {path}")
-    schema = _schema(path)
+    schema = _schema(path, runtime)
     if schema != dict(expected_schema):
         raise ValueError(f"Checkpoint schema does not match manifest: {path}")
     if missing := set(KEY_COLUMNS).difference(schema):
         raise ValueError(f"Checkpoint is missing grain key columns: {sorted(missing)}")
-    con = duckdb.connect(database=":memory:")
+    con = _checkpoint_connection(runtime)
     try:
         valid = con.execute(
             """SELECT COUNT(*) = COUNT(DISTINCT (ncodpers, fecha_dato))
@@ -335,12 +336,22 @@ def _validate_artifact(path: Path, expected_schema: Mapping[str, str]) -> None:
         raise ValueError(f"Checkpoint violates non-null unique customer-month grain: {path}")
 
 
-def _schema(path: Path) -> dict[str, str]:
-    con = duckdb.connect(database=":memory:")
+def _schema(path: Path, runtime: Mapping[str, Any] | None = None) -> dict[str, str]:
+    con = _checkpoint_connection(runtime)
     try:
         return {row[0]: row[1] for row in con.execute("DESCRIBE SELECT * FROM read_parquet(?)", [str(path)]).fetchall()}
     finally:
         con.close()
+
+
+def _checkpoint_connection(runtime: Mapping[str, Any] | None = None) -> duckdb.DuckDBPyConnection:
+    runtime = dict(runtime or {})
+    settings = {key: runtime[key] for key in ('memory_limit', 'threads') if runtime.get(key) is not None}
+    con = duckdb.connect(database=':memory:', config=settings)
+    if runtime.get('temp_directory'):
+        directory = Path(runtime['temp_directory']); directory.mkdir(parents=True, exist_ok=True)
+        con.execute('SET temp_directory = ?', [str(directory.resolve())])
+    return con
 
 
 def _code_revision() -> str | None:

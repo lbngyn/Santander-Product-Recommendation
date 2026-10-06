@@ -62,7 +62,7 @@ def build_bundle(run_dir, destination):
     for relative in index.values():
         model_dir = safe_file(run_dir, relative)
         if model_dir.is_dir():
-            for name in ("model.pkl", "artifact.json", "training_metrics.json", "joint_metadata.json"):
+            for name in ("model.pkl", "artifact.json", "training_metrics.json", "training_history.json", "joint_metadata.json"):
                 selected.append((model_dir / name).relative_to(run_dir).as_posix())
         elif model_dir.is_file():
             selected.append(model_dir.relative_to(run_dir).as_posix())  # popularity artifact
