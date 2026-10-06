@@ -1,0 +1,49 @@
+pipeline:
+  version: lightgbm-acquisition-only-engineered-independent-v1
+  description: Acquisition-only independent LightGBM with persona, prior history and frozen dual-Monetary RFM tiers.
+  approach: independent
+  comparison_id: engineered-acquisition-only-v1
+  project_id: santander-product-recommendation
+data:
+  checkpoint_version: null
+split:
+  validation_start: '2016-05-01'
+  validation_end: '2016-06-01'
+features:
+  scope: approved_engineered
+  income_policy: accepted_canonical_static
+  acquisition_policy: nearest_previous_observed_record
+  # Exact EDA export with selected_tiering, relative to SANTANDER_DATA_ROOT.
+  # Alternatively supply rfm_boundaries with recency/frequency/monetary_portfolio/monetary_renta (LOG scale).
+  rfm_spec_path: processed/EDA/rfm_tiering_features_meta.json
+model:
+  version: acquisition-engineered-independent-v1
+  n_estimators: 300
+  random_state: 42
+  record_training_metrics: true
+  training_log_period: 20
+  lightgbm_params:
+    learning_rate: 0.05
+    num_leaves: 31
+    max_bin: 255
+    force_col_wise: true
+    histogram_pool_size: 256
+    verbosity: -1
+runtime:
+  memory_limit: 2GB
+  threads: 2
+  batch_customer_months: 10000
+processing:
+  splits: [train, validation, test]
+  force_process: false
+  force_features: []
+  force_functions: []
+competition:
+  raw_test: raw/test_ver2.csv
+  sample_submission: raw/sample_submission.csv
+tracking:
+  mlflow:
+    experiment_name: santander-acquisition-only-engineered-v1
+  gcs:
+    bucket: null
+    prefix: model-runs
