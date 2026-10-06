@@ -1,0 +1,31 @@
+"""Notebook API and CLI for engineered joint acquisition models."""
+import argparse
+import sys
+from pathlib import Path
+from dotenv import load_dotenv
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+load_dotenv(PROJECT_ROOT / '.env')
+from src.pipeline.lightgbm_acquisition_only_engineered_joint import (
+    DEFAULT_CONFIG, load_config, preview, prepare_dataset, train_run, validate_run,
+    prepare_test, create_submission, finalize_run, publish_run,
+    run_lightgbm_acquisition_only_engineered_joint, run_lightgbm_acquisition_only_engineered_joint_from_config,
+)
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', default=DEFAULT_CONFIG)
+    parser.add_argument('--rfm-spec')
+    parser.add_argument('--comparison-id')
+    parser.add_argument('--checkpoint-version', type=int)
+    parser.add_argument('--preview', action='store_true')
+    parser.add_argument('--publish', action='store_true')
+    args = parser.parse_args()
+    config = load_config(args.config, comparison_id=args.comparison_id, checkpoint_version=args.checkpoint_version)
+    if args.rfm_spec:
+        config['features']['rfm_spec_path'] = args.rfm_spec
+    print(preview(config) if args.preview else run_lightgbm_acquisition_only_engineered_joint(config, publish=args.publish))
+
+if __name__ == '__main__':
+    main()
