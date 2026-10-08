@@ -21,6 +21,10 @@ from src.features.checkpoint_store import (
 from src.features.customer_history import HISTORY_FEATURE_NAMES, quote
 from src.features.feature_store import acquisition_feature_names, materialize_customer_month_feature_group
 from src.features.persona import PERSONA_FEATURES, RAW_PERSONA_COLUMNS
+from src.features.rfm_tiering import (
+    CANONICAL_RFM_BOUNDARIES, CANONICAL_RFM_METHODS, CANONICAL_RFM_TIER_FEATURE_NAMES,
+    CANONICAL_RFM_TIER_INPUTS, materialize_canonical_rfm_tiers,
+)
 from src.ingestion.checkpoint import build_interim_checkpoint
 from src.preprocessing.customer_profile import preprocess_customer_profile_baseline
 from src.preprocessing.renta_monetary import RENTA_OUTPUTS, preprocess_renta_monetary
@@ -30,7 +34,7 @@ from src.products import PRODUCT_COLUMNS
 PREPROCESSING_MARKER = "profile_preprocessed"
 PROFILE_COLUMNS = (*RAW_PERSONA_COLUMNS, "conyuemp", "nomprov")
 ENGINEERED_FEATURES = tuple(dict.fromkeys((
-    *PERSONA_FEATURES, *HISTORY_FEATURE_NAMES,
+    *PERSONA_FEATURES, *HISTORY_FEATURE_NAMES, *CANONICAL_RFM_TIER_FEATURE_NAMES,
     *("prev_" + name for name in PRODUCT_COLUMNS),
     *acquisition_feature_names(PRODUCT_COLUMNS),
 )))
@@ -55,6 +59,7 @@ PIPELINE_FUNCTION_OUTPUTS: dict[str, tuple[str, ...]] = {
     "acquisitions_last_3m_sql": ("acquisitions_last_3m",),
     "acquisitions_last_6m_sql": ("acquisitions_last_6m",),
     "cumulative_drops_sql": ("cumulative_drops",),
+    "rfm_tiering": CANONICAL_RFM_TIER_FEATURE_NAMES,
 }
 
 # Actual persisted inputs: history functions currently compute their shared
@@ -64,6 +69,7 @@ PIPELINE_FUNCTION_INPUTS = {
     for name in PIPELINE_FUNCTION_OUTPUTS
 }
 PIPELINE_FUNCTION_INPUTS.update({
+    "rfm_tiering": CANONICAL_RFM_TIER_INPUTS,
     "customer_profile_preprocessing": (*KEY_COLUMNS, "age", "antiguedad", "renta"),
     "renta_monetary_preprocessing": (*KEY_COLUMNS, "renta", "cod_prov", "pais_residencia"),
 })
@@ -288,13 +294,22 @@ def run_data_pipeline(
         return {"train": merge(current["train"], income, run_dir / "income_candidate.parquet",
                                (*RENTA_OUTPUTS, "renta"))}
 
+    def tier_rfm(current: dict[str, Path]) -> dict[str, Path]:
+        result = materialize_canonical_rfm_tiers(
+            current["train"], run_dir / "rfm_tiering_candidate.parquet",
+            force_process=True, memory_limit=memory_limit, temp_directory=spill,
+        )
+        return {"train": result}
+
     steps = [
         ProcessingStep("customer_profile_preprocessing", (*profile_outputs, PREPROCESSING_MARKER),
                        (*KEY_COLUMNS, "age", "antiguedad", "renta"), preprocess, validate),
         ProcessingStep("renta_monetary_preprocessing", (*RENTA_OUTPUTS, "renta"),
                        (*KEY_COLUMNS, "renta", "cod_prov", "pais_residencia"), preprocess_income, validate),
         *(feature_step(name, outputs) for name, outputs in PIPELINE_FUNCTION_OUTPUTS.items()
-          if name not in {"customer_profile_preprocessing", "renta_monetary_preprocessing"}),
+          if name not in {"customer_profile_preprocessing", "renta_monetary_preprocessing", "rfm_tiering"}),
+        ProcessingStep("rfm_tiering", CANONICAL_RFM_TIER_FEATURE_NAMES,
+                       CANONICAL_RFM_TIER_INPUTS, tier_rfm, validate),
     ]
     candidates, processing = run_processing_pipeline(
         working, steps, force_process=force_process, required_features=required,
@@ -332,6 +347,7 @@ def run_data_pipeline(
         "publish_checkpoint": publish_checkpoint, "raw_filename": raw_filename,
         "chunksize": chunksize, "memory_limit": memory_limit,
         "renta_clip_upper_quantile": renta_clip_upper_quantile,
+        "rfm_tiering": {"boundaries": CANONICAL_RFM_BOUNDARIES, "methods": CANONICAL_RFM_METHODS},
         "preprocessing_stats": (
             json.loads((run_dir / "profile/preprocessing_stats.json").read_text(encoding="utf-8"))
             if processing[0]["decision"] == "RUN"

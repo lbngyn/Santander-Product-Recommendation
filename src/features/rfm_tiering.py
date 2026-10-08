@@ -1,4 +1,4 @@
-"""Materialise dual-Monetary RFM tiers for offline segmentation.
+"""Materialise frozen canonical and dual-Monetary RFM tiers.
 
 The EDA notebook evaluates several ways to select tier boundaries.  Production
 code deliberately does not refit or select those boundaries: callers must
@@ -30,6 +30,82 @@ RFM_TIERING_FEATURE_NAMES: tuple[str, ...] = (
     "RFM_portfolio_tier",
     "RFM_renta_tier",
 )
+
+
+
+# Frozen selection approved from RFM_Tiering_EDA; monetary is portfolio size.
+CANONICAL_RFM_BOUNDARIES = {
+    "recency": (1.7063406529255913, 3.5948354200815933, 6.349777031935352),
+    "frequency": (0.5, 1.5, 2.931542461005199),
+    "monetary": (0.0, 1.0, 2.0, 6.0),
+}
+CANONICAL_RFM_METHODS = {
+    "recency": "kmeans_k4", "frequency": "kmeans_k4", "monetary": "rule_k5",
+}
+CANONICAL_RFM_TIER_FEATURE_NAMES = (
+    "R_score", "F_score", "M_score", "R_tier", "F_tier", "M_tier",
+    "RFM_score", "RFM_tier",
+)
+CANONICAL_RFM_TIER_INPUTS = (
+    "ncodpers", "fecha_dato", "rfm_recency_months", "rfm_never_acquired_before",
+    "rfm_frequency", "rfm_monetary",
+)
+
+
+def materialize_canonical_rfm_tiers(
+    source_path: str | Path,
+    destination_path: str | Path,
+    *,
+    force_process: bool = False,
+    memory_limit: str | None = None,
+    temp_directory: str | Path | None = None,
+) -> Path:
+    """Add frozen portfolio RFM scores/tiers, preserving all unrelated columns.
+
+    No fitting occurs. R=0 denotes NEVER; absent F/M remain NULL scores
+    and receive MISSING tier labels. Raw features are retained unchanged.
+    """
+    source, destination = Path(source_path), Path(destination_path)
+    con = _connect(memory_limit, temp_directory)
+    try:
+        columns = _columns(con, source)
+        if not force_process and set(CANONICAL_RFM_TIER_FEATURE_NAMES).issubset(columns):
+            return source
+        if missing := set(CANONICAL_RFM_TIER_INPUTS).difference(columns):
+            raise ValueError(f"Canonical RFM inputs missing: {sorted(missing)}")
+        r = _tier_case_sql("rfm_recency_months", CANONICAL_RFM_BOUNDARIES["recency"], lower_is_better=True)
+        f = _tier_case_sql("rfm_frequency", CANONICAL_RFM_BOUNDARIES["frequency"], lower_is_better=False)
+        m = _tier_case_sql("rfm_monetary", CANONICAL_RFM_BOUNDARIES["monetary"], lower_is_better=False)
+        excluded = columns.intersection(CANONICAL_RFM_TIER_FEATURE_NAMES)
+        projection = "*" + (" EXCLUDE (" + ", ".join(quote(c) for c in sorted(excluded)) + ")" if excluded else "")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_suffix(destination.suffix + ".tmp")
+        con.execute(f"""
+            COPY (
+                WITH scored AS (
+                    SELECT {projection},
+                        CAST(CASE WHEN rfm_recency_months IS NULL OR rfm_never_acquired_before = 1
+                             THEN 0 ELSE ({r}) END AS TINYINT) AS R_score,
+                        CAST(CASE WHEN rfm_frequency IS NULL THEN NULL ELSE ({f}) END AS TINYINT) AS F_score,
+                        CAST(CASE WHEN rfm_monetary IS NULL THEN NULL ELSE ({m}) END AS TINYINT) AS M_score
+                    FROM read_parquet('{_path(source)}')
+                ), tiered AS (
+                    SELECT *,
+                        CASE WHEN R_score = 0 THEN 'NEVER' ELSE 'R' || CAST(R_score AS VARCHAR) END AS R_tier,
+                        CASE WHEN F_score IS NULL THEN 'MISSING' ELSE 'F' || CAST(F_score AS VARCHAR) END AS F_tier,
+                        CASE WHEN M_score IS NULL THEN 'MISSING' ELSE 'M' || CAST(M_score AS VARCHAR) END AS M_tier
+                    FROM scored
+                )
+                SELECT *,
+                    CAST(R_score AS VARCHAR) || CAST(F_score AS VARCHAR) || CAST(M_score AS VARCHAR) AS RFM_score,
+                    R_tier || '-' || F_tier || '-' || M_tier AS RFM_tier
+                FROM tiered
+            ) TO '{_path(temporary)}' (FORMAT PARQUET, COMPRESSION ZSTD)
+        """)
+    finally:
+        con.close()
+    temporary.replace(destination)
+    return destination
 
 
 def build_renta_monetary_proxy(
@@ -148,7 +224,7 @@ def _tier_case_sql(column: str, boundaries: Sequence[Real], *, lower_is_better: 
     clauses = []
     for index, value in enumerate(values, start=1):
         score = tier_count - index + 1 if lower_is_better else index
-        clauses.append(f"WHEN {quote(column)} <= {value:.12g} THEN {score}")
+        clauses.append(f"WHEN {quote(column)} <= {value:.17g} THEN {score}")
     final = 1 if lower_is_better else tier_count
     return "CASE " + " ".join(clauses) + f" ELSE {final} END"
 
