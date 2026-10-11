@@ -10,6 +10,7 @@ split:
   validation_start: '2016-05-01'
   validation_end: '2016-06-01'
 features:
+  monetary_proxy: porfolio_deep # porfolio_deep | rental | rarity_rental (tiering pending EDA)
   scope: approved_engineered
   income_policy: accepted_canonical_static
   acquisition_policy: nearest_previous_observed_record

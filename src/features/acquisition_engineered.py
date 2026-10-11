@@ -10,6 +10,7 @@ from src.features import acquisition_only as original
 from src.features.acquisition_only_contract import FEATURES, KEYS, parquet, quote
 from src.features.persona import MODEL_PERSONA_FEATURES, CATEGORICAL_PERSONA_FEATURES
 from src.features.customer_history import HISTORY_FEATURE_NAMES
+from src.features.rfm.monetary_solver import solve_monetary_proxy
 from src.features.rfm_tiering import RFM_TIERING_FEATURE_NAMES, materialize_rfm_tiering_features, _tier_case_sql
 from src.features.feature_store import materialize_customer_month_feature_group
 from src.features.checkpoint_store import CheckpointStore, ProcessingStep, plan_processing_pipeline
@@ -23,11 +24,14 @@ TIERS = tuple(n for n in RFM_TIERING_FEATURE_NAMES if n not in ('renta_filled', 
 MODEL_FEATURES = list(dict.fromkeys([*FEATURES, *PERSONA, *HISTORY_FEATURE_NAMES, *TIERS]))
 FUNCTION_OUTPUTS = {'original_inputs': tuple(FEATURES), 'persona_features': PERSONA,
                     'history_features': HISTORY_FEATURE_NAMES, 'rfm_tiering': TIERS}
-TIER_CATEGORIES = ('RFM_portfolio_score', 'RFM_renta_score', 'RFM_portfolio_tier', 'RFM_renta_tier')
+TIER_CATEGORIES = ('M_tier', 'RFM_portfolio_score', 'RFM_renta_score', 'RFM_portfolio_tier', 'RFM_renta_tier')
 
 
 def frozen_boundaries(config, root):
     """Read the exact EDA export (selected_tiering), or explicit frozen values."""
+    proxy = solve_monetary_proxy(config['features'].get('monetary_proxy', 'porfolio_deep'))
+    if proxy.name == 'rarity_rental':
+        proxy.tier_sql(proxy.column, ())
     spec = config['features'].get('rfm_boundaries')
     if spec is None:
         declared = config['features'].get('rfm_spec_path')
@@ -104,8 +108,12 @@ def _check_identity(output, config, boundaries):
     identity = {'validation_start': config['split']['validation_start'],
                 'validation_end': config['split']['validation_end'], 'rfm_boundaries': boundaries,
                 'income_policy': 'accepted_canonical_static',
+                'monetary_proxy': config['features'].get('monetary_proxy', 'porfolio_deep'),
                 'checkpoint_version': config['data'].get('checkpoint_version')}
-    if path.exists() and read_json(path) != identity:
+    previous = read_json(path) if path.exists() else None
+    if previous is not None:
+        previous.setdefault('monetary_proxy', 'porfolio_deep')
+    if previous is not None and previous != identity:
         raise ValueError('Prepared feature identity differs; use a new comparison_id')
     return identity
 
@@ -185,7 +193,8 @@ def _split_checkpoint(config, output, split, base, source, boundaries, work, tes
             with connection(runtime, work) as con:
                 original._copy(con, f"SELECT ncodpers,fecha_dato,renta AS renta_filled,'accepted_canonical' AS renta_imputation_method FROM {parquet(current)}", proxy)
             narrow = materialize_rfm_tiering_features(current, proxy, work / 'tiers.parquet', boundaries=boundaries,
-                force_process=True, memory_limit=runtime['memory_limit'], temp_directory=work / 'spill')
+                force_process=True, memory_limit=runtime['memory_limit'], temp_directory=work / 'spill',
+                monetary_proxy=config['features'].get('monetary_proxy', 'porfolio_deep'))
         destination = work / f'merged_{name}.parquet'
         with connection(runtime, work) as con:
             _merge(con, current, narrow, outputs, destination)
@@ -196,7 +205,8 @@ def _split_checkpoint(config, output, split, base, source, boundaries, work, tes
         final = work / 'inputs.parquet'
         original._copy(con, f"SELECT {', '.join(map(quote,[*KEYS,*MODEL_FEATURES]))} FROM {parquet(current)} ORDER BY ncodpers,fecha_dato", final)
     version = store.publish({split: final}, parent_version=version['version'] if version else None,
-        processing=plan, configuration={'rfm_boundaries': boundaries, 'income_policy': 'accepted_canonical_static'})
+        processing=plan, configuration={'rfm_boundaries': boundaries, 'income_policy': 'accepted_canonical_static',
+                       'monetary_proxy': config['features'].get('monetary_proxy', 'porfolio_deep')})
     # Candidate files are disposable; published versions are never mutated.
     for path in work.glob('*.parquet'):
         path.unlink()
@@ -229,7 +239,8 @@ def prepare(config, root, work):
         shutil.copy2(record['path'], pack / f'{split}_inputs.parquet')
         shutil.copy2(base / f'{split}_targets.parquet', pack / f'{split}_targets.parquet')
     contract = dict(read_json(base / 'feature_contract.json'))
-    contract.update(feature_names=MODEL_FEATURES, feature_scope='approved_engineered', rfm_boundaries=boundaries,
+    contract.update(monetary_proxy=config['features'].get('monetary_proxy', 'porfolio_deep'),
+        feature_names=MODEL_FEATURES, feature_scope='approved_engineered', rfm_boundaries=boundaries,
         forbidden_inputs=['current_product_states','acq_*','n_acquisitions','sampled_for_*','lifecycle_*','CLV_*'],
         income_policy='accepted_canonical_static_income',
         feature_availability={'product_history': 'strictly_before_prediction_snapshot',

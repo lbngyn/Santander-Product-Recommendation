@@ -11,11 +11,15 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from numbers import Real
-from math import isfinite
 
 import duckdb
 
 from src.features.customer_history import quote
+from src.features.rfm.recency import recency_tier_sql
+from src.features.rfm.frequency import frequency_tier_sql
+from src.features.rfm.monetary_rental import build_renta_monetary_proxy
+from src.features.rfm.monetary_solver import solve_monetary_proxy
+from src.features.rfm.tiering_utils import tier_case_sql as _tier_case_sql, _connect, _columns, _path
 
 
 RFM_TIERING_FEATURE_NAMES: tuple[str, ...] = (
@@ -25,6 +29,8 @@ RFM_TIERING_FEATURE_NAMES: tuple[str, ...] = (
     "F_score",
     "M_portfolio_score",
     "M_renta_score",
+    "M_score",
+    "M_tier",
     "RFM_portfolio_score",
     "RFM_renta_score",
     "RFM_portfolio_tier",
@@ -43,8 +49,7 @@ CANONICAL_RFM_METHODS = {
     "recency": "kmeans_k4", "frequency": "kmeans_k4", "monetary": "rule_k5",
 }
 CANONICAL_RFM_TIER_FEATURE_NAMES = (
-    "R_score", "F_score", "M_score", "R_tier", "F_tier", "M_tier",
-    "RFM_score", "RFM_tier",
+    "R_score", "F_score", "M_score", "R_tier", "F_tier", "M_tier", "rfm_monetary_proxy",
 )
 CANONICAL_RFM_TIER_INPUTS = (
     "ncodpers", "fecha_dato", "rfm_recency_months", "rfm_never_acquired_before",
@@ -57,7 +62,10 @@ def materialize_canonical_rfm_tiers(
     destination_path: str | Path,
     *,
     force_process: bool = False,
+    monetary_proxy: str = "porfolio_deep",
+    monetary_boundaries: Sequence[Real] | None = None,
     memory_limit: str | None = None,
+    threads: int = 2,
     temp_directory: str | Path | None = None,
 ) -> Path:
     """Add frozen portfolio RFM scores/tiers, preserving all unrelated columns.
@@ -65,18 +73,31 @@ def materialize_canonical_rfm_tiers(
     No fitting occurs. R=0 denotes NEVER; absent F/M remain NULL scores
     and receive MISSING tier labels. Raw features are retained unchanged.
     """
+    proxy = solve_monetary_proxy(monetary_proxy)
+    if proxy.name == "rarity_rental":
+        proxy.tier_sql(proxy.column, ())
+    boundaries = monetary_boundaries
+    if boundaries is None:
+        if proxy.name == "rental":
+            raise ValueError("rental tiering requires frozen monetary_boundaries on the log1p scale")
+        boundaries = CANONICAL_RFM_BOUNDARIES["monetary"]
     source, destination = Path(source_path), Path(destination_path)
     con = _connect(memory_limit, temp_directory)
+    con.execute("SET threads = ?", [threads])
+    con.execute("SET preserve_insertion_order = false")
     try:
         columns = _columns(con, source)
         if not force_process and set(CANONICAL_RFM_TIER_FEATURE_NAMES).issubset(columns):
-            return source
-        if missing := set(CANONICAL_RFM_TIER_INPUTS).difference(columns):
+            matches = con.execute(f"SELECT COUNT(*) FILTER (WHERE rfm_monetary_proxy IS DISTINCT FROM ?) = 0 FROM read_parquet(?)",
+                                  [proxy.name, str(source)]).fetchone()[0]
+            if matches:
+                return source
+        if missing := set((*CANONICAL_RFM_TIER_INPUTS[:-1], proxy.column)).difference(columns):
             raise ValueError(f"Canonical RFM inputs missing: {sorted(missing)}")
-        r = _tier_case_sql("rfm_recency_months", CANONICAL_RFM_BOUNDARIES["recency"], lower_is_better=True)
-        f = _tier_case_sql("rfm_frequency", CANONICAL_RFM_BOUNDARIES["frequency"], lower_is_better=False)
-        m = _tier_case_sql("rfm_monetary", CANONICAL_RFM_BOUNDARIES["monetary"], lower_is_better=False)
-        excluded = columns.intersection(CANONICAL_RFM_TIER_FEATURE_NAMES)
+        r = recency_tier_sql("rfm_recency_months", CANONICAL_RFM_BOUNDARIES["recency"])
+        f = frequency_tier_sql("rfm_frequency", CANONICAL_RFM_BOUNDARIES["frequency"])
+        m = proxy.tier_sql("_monetary_value", boundaries)
+        excluded = columns.intersection(CANONICAL_RFM_TIER_FEATURE_NAMES) | {"_monetary_value"}
         projection = "*" + (" EXCLUDE (" + ", ".join(quote(c) for c in sorted(excluded)) + ")" if excluded else "")
         destination.parent.mkdir(parents=True, exist_ok=True)
         temporary = destination.with_suffix(destination.suffix + ".tmp")
@@ -87,8 +108,9 @@ def materialize_canonical_rfm_tiers(
                         CAST(CASE WHEN rfm_recency_months IS NULL OR rfm_never_acquired_before = 1
                              THEN 0 ELSE ({r}) END AS TINYINT) AS R_score,
                         CAST(CASE WHEN rfm_frequency IS NULL THEN NULL ELSE ({f}) END AS TINYINT) AS F_score,
-                        CAST(CASE WHEN rfm_monetary IS NULL THEN NULL ELSE ({m}) END AS TINYINT) AS M_score
-                    FROM read_parquet('{_path(source)}')
+                        CAST(CASE WHEN _monetary_value IS NULL THEN NULL ELSE ({m}) END AS TINYINT) AS M_score,
+                        '{proxy.name}' AS rfm_monetary_proxy
+                    FROM (SELECT *, {proxy.value_sql()} AS _monetary_value FROM read_parquet('{_path(source)}'))
                 ), tiered AS (
                     SELECT *,
                         CASE WHEN R_score = 0 THEN 'NEVER' ELSE 'R' || CAST(R_score AS VARCHAR) END AS R_tier,
@@ -96,10 +118,7 @@ def materialize_canonical_rfm_tiers(
                         CASE WHEN M_score IS NULL THEN 'MISSING' ELSE 'M' || CAST(M_score AS VARCHAR) END AS M_tier
                     FROM scored
                 )
-                SELECT *,
-                    CAST(R_score AS VARCHAR) || CAST(F_score AS VARCHAR) || CAST(M_score AS VARCHAR) AS RFM_score,
-                    R_tier || '-' || F_tier || '-' || M_tier AS RFM_tier
-                FROM tiered
+                SELECT * FROM tiered
             ) TO '{_path(temporary)}' (FORMAT PARQUET, COMPRESSION ZSTD)
         """)
     finally:
@@ -108,37 +127,6 @@ def materialize_canonical_rfm_tiers(
     return destination
 
 
-def build_renta_monetary_proxy(
-    source_path: str | Path,
-    destination_path: str | Path,
-    *,
-    force_process: bool = False,
-    memory_limit: str | None = None,
-    temp_directory: str | Path | None = None,
-) -> Path:
-    """Project already-preprocessed canonical income; never impute again.
-
-    The shared pipeline owns customer_history_geo_median_v1 preprocessing.
-    Declared outputs: renta_filled, renta_imputation_method.
-    """
-    source, destination = Path(source_path), Path(destination_path)
-    if not source.is_file():
-        raise FileNotFoundError(source)
-    con = _connect(memory_limit, temp_directory)
-    try:
-        outputs = {"ncodpers", "fecha_dato", "renta_filled", "renta_imputation_method"}
-        if missing := outputs.difference(_columns(con, source)):
-            raise ValueError(f"Canonical income is not preprocessed: {sorted(missing)}. Run Data Pipeline first.")
-        if source.resolve() == destination.resolve():
-            return source
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        temporary = destination.with_suffix(destination.suffix + ".tmp")
-        con.execute(f"COPY (SELECT ncodpers, fecha_dato, renta_filled, renta_imputation_method "
-                    f"FROM read_parquet('{_path(source)}')) TO '{_path(temporary)}' (FORMAT PARQUET, COMPRESSION ZSTD)")
-        temporary.replace(destination)
-        return destination
-    finally:
-        con.close()
 
 
 def materialize_rfm_tiering_features(
@@ -148,6 +136,7 @@ def materialize_rfm_tiering_features(
     *,
     boundaries: Mapping[str, Sequence[Real]],
     force_process: bool = False,
+    monetary_proxy: str = "porfolio_deep",
     memory_limit: str | None = None,
     temp_directory: str | Path | None = None,
 ) -> Path:
@@ -158,6 +147,10 @@ def materialize_rfm_tiering_features(
     with lower values as better; the remaining dimensions use higher-is-better
     scores.  A customer with no prior acquisition receives ``R_score = 0``.
     """
+    proxy = solve_monetary_proxy(monetary_proxy)
+    if proxy.name == "rarity_rental":
+        proxy.tier_sql(proxy.column, ())
+    selected_score = "M_portfolio_score" if proxy.name == "porfolio_deep" else "M_renta_score"
     required_boundaries = {"recency", "frequency", "monetary_portfolio", "monetary_renta"}
     if missing := required_boundaries.difference(boundaries):
         raise ValueError(f"Missing frozen RFM tier boundaries: {sorted(missing)}")
@@ -175,11 +168,16 @@ def materialize_rfm_tiering_features(
         if missing := {"ncodpers", "fecha_dato", "renta_filled"}.difference(renta_columns):
             raise ValueError(f"Renta proxy is missing columns: {sorted(missing)}")
         if destination.is_file() and not force_process and set(RFM_TIERING_FEATURE_NAMES).issubset(_columns(con, destination)):
-            return destination
-        r_case = _tier_case_sql("recency", boundaries["recency"], lower_is_better=True)
-        f_case = _tier_case_sql("frequency", boundaries["frequency"], lower_is_better=False)
-        mp_case = _tier_case_sql("monetary_portfolio", boundaries["monetary_portfolio"], lower_is_better=False)
-        mr_case = _tier_case_sql("monetary_renta_log", boundaries["monetary_renta"], lower_is_better=False)
+            cached_columns = _columns(con, destination)
+            if "rfm_monetary_proxy" in cached_columns and con.execute(
+                "SELECT COUNT(*) FILTER (WHERE rfm_monetary_proxy IS DISTINCT FROM ?) = 0 FROM read_parquet(?)",
+                [proxy.name, str(destination)],
+            ).fetchone()[0]:
+                return destination
+        r_case = recency_tier_sql("recency", boundaries["recency"])
+        f_case = frequency_tier_sql("frequency", boundaries["frequency"])
+        mp_case = solve_monetary_proxy("porfolio_deep").tier_sql("monetary_portfolio", boundaries["monetary_portfolio"])
+        mr_case = solve_monetary_proxy("rental").tier_sql("monetary_renta_log", boundaries["monetary_renta"])
         temporary = destination.with_suffix(destination.suffix + ".tmp")
         if temporary.exists():
             temporary.unlink()
@@ -200,7 +198,10 @@ def materialize_rfm_tiering_features(
                            CASE WHEN monetary_renta_log IS NULL THEN NULL ELSE ({mr_case}) END AS M_renta_score
                     FROM base
                 )
-                SELECT *,
+                SELECT *, {selected_score} AS M_score,
+                       CASE WHEN {selected_score} IS NULL THEN 'MISSING'
+                            ELSE 'M' || CAST({selected_score} AS VARCHAR) END AS M_tier,
+                       '{proxy.name}' AS rfm_monetary_proxy,
                        CASE WHEN R_score IS NOT NULL AND F_score IS NOT NULL AND M_portfolio_score IS NOT NULL
                             THEN CAST(R_score AS VARCHAR) || CAST(F_score AS VARCHAR) || CAST(M_portfolio_score AS VARCHAR) END AS RFM_portfolio_score,
                        CASE WHEN R_score IS NOT NULL AND F_score IS NOT NULL AND M_renta_score IS NOT NULL
@@ -214,34 +215,3 @@ def materialize_rfm_tiering_features(
         return destination
     finally:
         con.close()
-
-
-def _tier_case_sql(column: str, boundaries: Sequence[Real], *, lower_is_better: bool) -> str:
-    values = [float(value) for value in boundaries]
-    if values != sorted(values) or any(not isfinite(value) for value in values):
-        raise ValueError(f"Tier boundaries for {column} must be sorted finite values.")
-    tier_count = len(values) + 1
-    clauses = []
-    for index, value in enumerate(values, start=1):
-        score = tier_count - index + 1 if lower_is_better else index
-        clauses.append(f"WHEN {quote(column)} <= {value:.17g} THEN {score}")
-    final = 1 if lower_is_better else tier_count
-    return "CASE " + " ".join(clauses) + f" ELSE {final} END"
-
-
-def _connect(memory_limit: str | None, temp_directory: str | Path | None) -> duckdb.DuckDBPyConnection:
-    con = duckdb.connect(database=":memory:")
-    if memory_limit:
-        con.execute(f"SET memory_limit = '{str(memory_limit).replace(chr(39), chr(39) * 2)}'")
-    if temp_directory:
-        directory = Path(temp_directory); directory.mkdir(parents=True, exist_ok=True)
-        con.execute(f"SET temp_directory = '{_path(directory)}'")
-    return con
-
-
-def _columns(con: duckdb.DuckDBPyConnection, path: Path) -> set[str]:
-    return {row[0] for row in con.execute("DESCRIBE SELECT * FROM read_parquet(?)", [str(path)]).fetchall()}
-
-
-def _path(path: Path) -> str:
-    return str(path).replace("'", "''")

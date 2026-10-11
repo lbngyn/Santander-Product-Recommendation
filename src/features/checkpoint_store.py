@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 import duckdb
+from src.utils.run_files import sha256
 
 
 KEY_COLUMNS: tuple[str, str] = ("ncodpers", "fecha_dato")
@@ -46,10 +47,15 @@ class CheckpointStore:
         required_features: Sequence[str],
         *,
         required_artifacts: Sequence[str] = ("train", "test"),
+        required_configuration: Mapping[str, Any] | None = None,
+        configuration_defaults: Mapping[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         """Return the newest retained, valid version satisfying requirements."""
         required = set(required_features)
         for version in reversed(self._manifest()["versions"]):
+            configuration = {**(configuration_defaults or {}), **version.get("configuration", {})}
+            if any(configuration.get(key) != value for key, value in (required_configuration or {}).items()):
+                continue
             if not required.issubset(set(version.get("features", ()) )):
                 continue
             artifacts = version.get("artifacts", {})
@@ -67,6 +73,7 @@ class CheckpointStore:
         processing: Sequence[Mapping[str, Any]],
         configuration: Mapping[str, Any] | None = None,
         feature_definition_metadata: Mapping[str, Any] | None = None,
+        sidecars: Mapping[str, str | Path] | None = None,
     ) -> dict[str, Any]:
         """Validate candidates, atomically retain them, then append manifest."""
         if not candidates:
@@ -90,6 +97,16 @@ class CheckpointStore:
                 target = version_dir / f"{name}.parquet"
                 shutil.copy2(candidate, target)
                 retained[name] = target
+            retained_sidecars = {}
+            for name, candidate in (sidecars or {}).items():
+                if not name or Path(name).name != name or name in candidate_paths:
+                    raise ValueError(f"Invalid sidecar name: {name!r}")
+                target = version_dir / f"{name}.parquet"
+                shutil.copy2(candidate, target)
+                retained_sidecars[name] = {
+                    "path": str(target.relative_to(self.root)),
+                    "schema": _schema(target, self.runtime), "sha256": sha256(target),
+                }
             artifact_metadata = {name: _artifact_metadata(path, self.runtime) for name, path in retained.items()}
             for name, metadata in artifact_metadata.items():
                 _validate_artifact(retained[name], metadata["schema"], self.runtime)
@@ -117,6 +134,7 @@ class CheckpointStore:
                     for name, path in retained.items()
                 },
                 "features": shared_features,
+                "sidecars": retained_sidecars,
                 "feature_changes": changes,
                 "processing": list(processing),
                 "configuration": dict(configuration or {}),

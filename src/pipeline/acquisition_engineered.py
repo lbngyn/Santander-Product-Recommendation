@@ -37,6 +37,8 @@ def load_config(path, *, comparison_id=None, checkpoint_version=None):
         raise ValueError('Positive training/runtime budgets required')
     if set(config['processing'].get('splits', [])) - {'train','validation','test'}:
         raise ValueError('Unknown processing split')
+    from src.features.rfm.monetary_solver import solve_monetary_proxy
+    solve_monetary_proxy(config['features'].setdefault('monetary_proxy', 'porfolio_deep'))
     # Validate force selectors even when no checkpoints exist.
     from src.features.checkpoint_store import resolve_forced_steps
     resolve_forced_steps(features.FUNCTION_OUTPUTS,
@@ -77,6 +79,7 @@ def create_submission(run, *, config=None, prepared_test=None, sample_submission
     expected = store.root / version['artifacts']['test']['path']
     if (Path(path).resolve() != expected.resolve()
             or version['configuration'].get('rfm_boundaries') != contract['rfm_boundaries']
+            or version['configuration'].get('monetary_proxy', 'porfolio_deep') != contract.get('monetary_proxy', 'porfolio_deep')
             or not store.validate_version(version, required_features=contract['feature_names'])):
         raise ValueError('Prepared test does not match this run\'s approved feature checkpoint')
     template = Path(sample_submission or root / config['competition']['sample_submission'])
