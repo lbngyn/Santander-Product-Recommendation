@@ -12,3 +12,4 @@ dvc
 lightgbm
 scikit-learn
 pymc-marketing
+gensim
