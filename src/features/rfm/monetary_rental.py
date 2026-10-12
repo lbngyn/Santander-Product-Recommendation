@@ -3,6 +3,14 @@ from pathlib import Path
 import duckdb
 from .tiering_utils import _connect, _columns, _path, tier_case_sql
 
+# quantile_k5 selected by RFM_Tiering_EDA_dual_monetary_fixed.ipynb.
+# log1p of the full-precision raw cutoffs printed in cell 44; never refit.
+MONETARY_TIER_METHOD = "quantile_k5"
+MONETARY_TIER_BOUNDARIES = (
+    11.117270033486019, 11.379962571433758,
+    11.626696435266332, 11.93526682302867,
+)
+
 def build_renta_monetary_proxy(
     source_path: str | Path,
     destination_path: str | Path,

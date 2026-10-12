@@ -30,8 +30,6 @@ TIER_CATEGORIES = ('M_tier', 'RFM_portfolio_score', 'RFM_renta_score', 'RFM_port
 def frozen_boundaries(config, root):
     """Read the exact EDA export (selected_tiering), or explicit frozen values."""
     proxy = solve_monetary_proxy(config['features'].get('monetary_proxy', 'porfolio_deep'))
-    if proxy.name == 'rarity_rental':
-        proxy.tier_sql(proxy.column, ())
     spec = config['features'].get('rfm_boundaries')
     if spec is None:
         declared = config['features'].get('rfm_spec_path')

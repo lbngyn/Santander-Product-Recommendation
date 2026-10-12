@@ -13,12 +13,19 @@ from pathlib import Path
 from numbers import Real
 
 import duckdb
+import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.parquet as pq
 
 from src.features.customer_history import quote
 from src.features.rfm.recency import recency_tier_sql
 from src.features.rfm.frequency import frequency_tier_sql
-from src.features.rfm.monetary_rental import build_renta_monetary_proxy
+from src.features.rfm.monetary_rental import (
+    build_renta_monetary_proxy, MONETARY_TIER_BOUNDARIES as RENTAL_TIER_BOUNDARIES,
+    MONETARY_TIER_METHOD as RENTAL_TIER_METHOD,
+)
 from src.features.rfm.monetary_solver import solve_monetary_proxy
+from src.features.rfm.monetary_rarity_rental import MONETARY_TIER_BOUNDARIES as RARITY_TIER_BOUNDARIES
 from src.features.rfm.tiering_utils import tier_case_sql as _tier_case_sql, _connect, _columns, _path
 
 
@@ -56,6 +63,104 @@ CANONICAL_RFM_TIER_INPUTS = (
     "rfm_frequency", "rfm_monetary",
 )
 
+# Separate persisted contracts: all three can coexist, independent of M_score.
+MONETARY_PROXY_TIER_SPECS = {
+    "porfolio_deep": {"prefix": "portfolio", "boundaries": CANONICAL_RFM_BOUNDARIES["monetary"], "method": "rule_k5"},
+    "rental": {"prefix": "renta", "boundaries": RENTAL_TIER_BOUNDARIES, "method": RENTAL_TIER_METHOD},
+    "rarity_rental": {"prefix": "rarity", "boundaries": RARITY_TIER_BOUNDARIES, "method": "quantile_k3"},
+}
+MONETARY_PROXY_TIER_OUTPUTS = {
+    name: (f"M_{spec['prefix']}_score", f"M_{spec['prefix']}_tier",
+           f"RFM_{spec['prefix']}_score", f"RFM_{spec['prefix']}_tier")
+    for name, spec in MONETARY_PROXY_TIER_SPECS.items()
+}
+ALL_MONETARY_TIER_FEATURE_NAMES = tuple(
+    column for outputs in MONETARY_PROXY_TIER_OUTPUTS.values() for column in outputs
+)
+
+
+def _copy_tier_query(con, query, source, destination):
+    """Stream SQL output while preserving the fixed segment categorical dtype."""
+    import json
+    from src.features.rfm.segment_fixed import FEATURE_NAME, CATEGORIES
+    reader = con.execute(query).fetch_record_batch(50_000)
+    with pq.ParquetFile(source) as original:
+        metadata = dict(original.schema_arrow.metadata or {})
+    schema = reader.schema
+    index = schema.get_field_index(FEATURE_NAME)
+    if index >= 0:
+        import pandas as pd
+        categorical = pa.Table.from_pandas(pd.DataFrame({
+            FEATURE_NAME: pd.Categorical([], categories=CATEGORIES)
+        }), preserve_index=False)
+        category_metadata = json.loads(categorical.schema.metadata[b"pandas"])
+        pandas_metadata = json.loads(metadata.get(b"pandas", b"{}")) or category_metadata
+        pandas_metadata["columns"] = [c for c in pandas_metadata["columns"] if c["field_name"] != FEATURE_NAME]
+        pandas_metadata["columns"].extend(category_metadata["columns"])
+        metadata[b"pandas"] = json.dumps(pandas_metadata).encode()
+        schema = schema.set(index, pa.field(FEATURE_NAME, pa.dictionary(pa.int8(), pa.string()), nullable=False))
+    schema = schema.with_metadata(metadata)
+    try:
+        with pq.ParquetWriter(destination, schema, compression="zstd") as writer:
+            for batch in reader:
+                table = pa.Table.from_batches([batch])
+                if index >= 0:
+                    codes = pc.index_in(table.column(FEATURE_NAME), value_set=pa.array(CATEGORIES))
+                    if codes.null_count:
+                        raise ValueError("Unknown/NULL fixed segment category during tier materialization")
+                    category = pa.DictionaryArray.from_arrays(pc.cast(codes.combine_chunks(), pa.int8()), pa.array(CATEGORIES))
+                    table = table.set_column(index, schema.field(FEATURE_NAME), category)
+                writer.write_table(table.replace_schema_metadata(metadata))
+    finally:
+        reader.close()
+
+
+def materialize_monetary_proxy_tiers(source_path, destination_path, *, monetary_proxy,
+                                     force_process=False, memory_limit=None, threads=2,
+                                     temp_directory=None):
+    """Append one proxy's frozen tiers/profiles without replacing other proxies."""
+    proxy = solve_monetary_proxy(monetary_proxy)
+    spec = MONETARY_PROXY_TIER_SPECS[proxy.name]
+    outputs = MONETARY_PROXY_TIER_OUTPUTS[proxy.name]
+    source, destination = Path(source_path), Path(destination_path)
+    con = _connect(memory_limit, temp_directory)
+    con.execute("SET threads = ?", [threads])
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    try:
+        columns = _columns(con, source)
+        if not force_process and set(outputs).issubset(columns):
+            return source
+        if missing := {"ncodpers", "fecha_dato", "R_score", "F_score", proxy.column}.difference(columns):
+            raise ValueError(f"{proxy.name} tiering inputs missing: {sorted(missing)}")
+        value = (f"CASE WHEN {quote(proxy.column)} >= 0 AND isfinite({quote(proxy.column)}) "
+                 f"THEN {proxy.value_sql()} ELSE NULL END")
+        score = proxy.tier_sql("_proxy_tier_value", spec["boundaries"])
+        score_name, tier_name, rfm_score_name, rfm_tier_name = outputs
+        excluded = set(outputs).intersection(columns)
+        projection = "*" + (" EXCLUDE (" + ", ".join(quote(c) for c in sorted(excluded)) + ")" if excluded else "")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        _copy_tier_query(con, f"""
+            WITH scored AS (
+                SELECT * EXCLUDE (_proxy_tier_value),
+                       CAST(CASE WHEN _proxy_tier_value IS NULL THEN NULL ELSE ({score}) END AS TINYINT) AS {score_name}
+                FROM (SELECT {projection}, {value} AS _proxy_tier_value FROM read_parquet('{_path(source)}'))
+            )
+            SELECT *,
+                CASE WHEN {score_name} IS NULL THEN 'MISSING' ELSE 'M' || CAST({score_name} AS VARCHAR) END AS {tier_name},
+                CASE WHEN R_score IS NOT NULL AND F_score IS NOT NULL AND {score_name} IS NOT NULL
+                     THEN CAST(R_score AS VARCHAR) || CAST(F_score AS VARCHAR) || CAST({score_name} AS VARCHAR) END AS {rfm_score_name},
+                CASE WHEN R_score IS NOT NULL AND F_score IS NOT NULL AND {score_name} IS NOT NULL
+                     THEN (CASE WHEN R_score = 0 THEN 'NEVER' ELSE 'R' || CAST(R_score AS VARCHAR) END)
+                          || '-F' || CAST(F_score AS VARCHAR) || '-M' || CAST({score_name} AS VARCHAR) END AS {rfm_tier_name}
+            FROM scored
+        """, source, temporary)
+        temporary.replace(destination)
+        return destination
+    finally:
+        con.close()
+        if temporary.exists():
+            temporary.unlink()
+
 
 def materialize_canonical_rfm_tiers(
     source_path: str | Path,
@@ -68,19 +173,18 @@ def materialize_canonical_rfm_tiers(
     threads: int = 2,
     temp_directory: str | Path | None = None,
 ) -> Path:
-    """Add frozen portfolio RFM scores/tiers, preserving all unrelated columns.
+    """Add frozen RFM scores/tiers for the selected monetary proxy.
 
     No fitting occurs. R=0 denotes NEVER; absent F/M remain NULL scores
     and receive MISSING tier labels. Raw features are retained unchanged.
     """
     proxy = solve_monetary_proxy(monetary_proxy)
-    if proxy.name == "rarity_rental":
-        proxy.tier_sql(proxy.column, ())
     boundaries = monetary_boundaries
     if boundaries is None:
         if proxy.name == "rental":
             raise ValueError("rental tiering requires frozen monetary_boundaries on the log1p scale")
-        boundaries = CANONICAL_RFM_BOUNDARIES["monetary"]
+        boundaries = (RARITY_TIER_BOUNDARIES if proxy.name == "rarity_rental"
+                      else CANONICAL_RFM_BOUNDARIES["monetary"])
     source, destination = Path(source_path), Path(destination_path)
     con = _connect(memory_limit, temp_directory)
     con.execute("SET threads = ?", [threads])
@@ -88,7 +192,12 @@ def materialize_canonical_rfm_tiers(
     try:
         columns = _columns(con, source)
         if not force_process and set(CANONICAL_RFM_TIER_FEATURE_NAMES).issubset(columns):
-            matches = con.execute(f"SELECT COUNT(*) FILTER (WHERE rfm_monetary_proxy IS DISTINCT FROM ?) = 0 FROM read_parquet(?)",
+            expected_m = proxy.tier_sql("_cached_monetary_value", boundaries)
+            matches = con.execute(f"""SELECT COUNT(*) FILTER (
+                WHERE rfm_monetary_proxy IS DISTINCT FROM ?
+                   OR M_score IS DISTINCT FROM
+                      (CASE WHEN _cached_monetary_value IS NULL THEN NULL ELSE ({expected_m}) END)
+                ) = 0 FROM (SELECT *, {proxy.value_sql()} AS _cached_monetary_value FROM read_parquet(?))""",
                                   [proxy.name, str(source)]).fetchone()[0]
             if matches:
                 return source
@@ -101,8 +210,7 @@ def materialize_canonical_rfm_tiers(
         projection = "*" + (" EXCLUDE (" + ", ".join(quote(c) for c in sorted(excluded)) + ")" if excluded else "")
         destination.parent.mkdir(parents=True, exist_ok=True)
         temporary = destination.with_suffix(destination.suffix + ".tmp")
-        con.execute(f"""
-            COPY (
+        _copy_tier_query(con, f"""
                 WITH scored AS (
                     SELECT {projection},
                         CAST(CASE WHEN rfm_recency_months IS NULL OR rfm_never_acquired_before = 1
@@ -119,8 +227,7 @@ def materialize_canonical_rfm_tiers(
                     FROM scored
                 )
                 SELECT * FROM tiered
-            ) TO '{_path(temporary)}' (FORMAT PARQUET, COMPRESSION ZSTD)
-        """)
+        """, source, temporary)
     finally:
         con.close()
     temporary.replace(destination)
@@ -148,9 +255,9 @@ def materialize_rfm_tiering_features(
     scores.  A customer with no prior acquisition receives ``R_score = 0``.
     """
     proxy = solve_monetary_proxy(monetary_proxy)
-    if proxy.name == "rarity_rental":
-        proxy.tier_sql(proxy.column, ())
     selected_score = "M_portfolio_score" if proxy.name == "porfolio_deep" else "M_renta_score"
+    if proxy.name == "rarity_rental":
+        selected_score = proxy.tier_sql(proxy.column, boundaries.get("monetary_rarity", RARITY_TIER_BOUNDARIES))
     required_boundaries = {"recency", "frequency", "monetary_portfolio", "monetary_renta"}
     if missing := required_boundaries.difference(boundaries):
         raise ValueError(f"Missing frozen RFM tier boundaries: {sorted(missing)}")
@@ -163,6 +270,8 @@ def materialize_rfm_tiering_features(
     try:
         feature_columns, renta_columns = _columns(con, feature_store), _columns(con, renta_proxy)
         required_features = {"ncodpers", "fecha_dato", "rfm_recency_months", "rfm_never_acquired_before", "rfm_frequency", "rfm_monetary"}
+        if proxy.name == "rarity_rental":
+            required_features.add(proxy.column)
         if missing := required_features.difference(feature_columns):
             raise ValueError(f"Feature store is missing RFM inputs: {sorted(missing)}")
         if missing := {"ncodpers", "fecha_dato", "renta_filled"}.difference(renta_columns):
@@ -178,6 +287,7 @@ def materialize_rfm_tiering_features(
         f_case = frequency_tier_sql("frequency", boundaries["frequency"])
         mp_case = solve_monetary_proxy("porfolio_deep").tier_sql("monetary_portfolio", boundaries["monetary_portfolio"])
         mr_case = solve_monetary_proxy("rental").tier_sql("monetary_renta_log", boundaries["monetary_renta"])
+        rarity_projection = f", f.{quote(proxy.column)}" if proxy.name == "rarity_rental" else ""
         temporary = destination.with_suffix(destination.suffix + ".tmp")
         if temporary.exists():
             temporary.unlink()
@@ -188,7 +298,7 @@ def materialize_rfm_tiering_features(
                            f.rfm_never_acquired_before AS never_acquired_before,
                            f.rfm_frequency AS frequency, f.rfm_monetary AS monetary_portfolio,
                            r.renta_filled, r.renta_imputation_method,
-                           LN(1 + r.renta_filled) AS monetary_renta_log
+                           LN(1 + r.renta_filled) AS monetary_renta_log {rarity_projection}
                     FROM read_parquet('{_path(feature_store)}') f
                     LEFT JOIN read_parquet('{_path(renta_proxy)}') r USING (ncodpers, fecha_dato)
                 ), scored AS (

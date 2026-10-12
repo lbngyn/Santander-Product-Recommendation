@@ -16,7 +16,7 @@ class MonetaryProxy:
         return (monetary_rental.monetary_value_sql(self.column)
                 if self.transform == "log1p" else quote(self.column))
 
-    def tier_sql(self, column, boundaries):
+    def tier_sql(self, column, boundaries=None):
         return self.module.monetary_tier_sql(column, boundaries)
 
 

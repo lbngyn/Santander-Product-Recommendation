@@ -24,19 +24,31 @@ from src.features.persona import PERSONA_FEATURES, RAW_PERSONA_COLUMNS
 from src.features.rfm_tiering import (
     CANONICAL_RFM_BOUNDARIES, CANONICAL_RFM_METHODS, CANONICAL_RFM_TIER_FEATURE_NAMES,
     CANONICAL_RFM_TIER_INPUTS, materialize_canonical_rfm_tiers,
+    ALL_MONETARY_TIER_FEATURE_NAMES, MONETARY_PROXY_TIER_OUTPUTS,
+    MONETARY_PROXY_TIER_SPECS, materialize_monetary_proxy_tiers,
 )
 from src.ingestion.checkpoint import build_interim_checkpoint
 from src.preprocessing.customer_profile import preprocess_customer_profile_baseline
 from src.preprocessing.renta_monetary import RENTA_OUTPUTS, preprocess_renta_monetary
 from src.products import PRODUCT_COLUMNS
 from src.features.rfm.monetary_solver import solve_monetary_proxy
-from src.features.rfm.monetary_rarity_rental import FEATURE_NAME as RARITY_FEATURE, FORMULA_VERSION, build_rarity_monetary_proxy
+from src.features.rfm.segment_fixed import (
+    FEATURE_NAME as SEGMENT_FEATURE, INPUT_COLUMNS as SEGMENT_INPUTS,
+    PROVENANCE as SEGMENT_PROVENANCE, materialize_fixed_rfm_segments,
+    segment_distribution,
+)
+from src.features.rfm.monetary_rarity_rental import (
+    FEATURE_NAME as RARITY_FEATURE, FORMULA_VERSION, build_rarity_monetary_proxy,
+    MONETARY_TIER_BOUNDARIES as RARITY_TIER_BOUNDARIES,
+    MONETARY_TIER_METHOD as RARITY_TIER_METHOD,
+)
 
 
 PREPROCESSING_MARKER = "profile_preprocessed"
 PROFILE_COLUMNS = (*RAW_PERSONA_COLUMNS, "conyuemp", "nomprov")
 ENGINEERED_FEATURES = tuple(dict.fromkeys((
-    *PERSONA_FEATURES, *HISTORY_FEATURE_NAMES, *CANONICAL_RFM_TIER_FEATURE_NAMES, RARITY_FEATURE,
+    *PERSONA_FEATURES, *HISTORY_FEATURE_NAMES, *CANONICAL_RFM_TIER_FEATURE_NAMES,
+    *ALL_MONETARY_TIER_FEATURE_NAMES, RARITY_FEATURE, SEGMENT_FEATURE,
     *("prev_" + name for name in PRODUCT_COLUMNS),
     *acquisition_feature_names(PRODUCT_COLUMNS),
 )))
@@ -63,7 +75,16 @@ PIPELINE_FUNCTION_OUTPUTS: dict[str, tuple[str, ...]] = {
     "cumulative_drops_sql": ("cumulative_drops",),
     "monetary_rarity_rental": (RARITY_FEATURE,),
     "rfm_tiering": CANONICAL_RFM_TIER_FEATURE_NAMES,
+    "rfm_segment_fixed": (SEGMENT_FEATURE,),
 }
+MONETARY_TIER_FUNCTIONS = {
+    "rfm_monetary_porfolio_tiering": "porfolio_deep",
+    "rfm_monetary_rental_tiering": "rental",
+    "rfm_monetary_rarity_tiering": "rarity_rental",
+}
+PIPELINE_FUNCTION_OUTPUTS.update({
+    name: MONETARY_PROXY_TIER_OUTPUTS[proxy] for name, proxy in MONETARY_TIER_FUNCTIONS.items()
+})
 
 # Actual persisted inputs: history functions currently compute their shared
 # intermediates directly from product states, not from stored prev_/acq_ outputs.
@@ -73,9 +94,14 @@ PIPELINE_FUNCTION_INPUTS = {
 }
 PIPELINE_FUNCTION_INPUTS.update({
     "rfm_tiering": CANONICAL_RFM_TIER_INPUTS,
+    "rfm_segment_fixed": (*KEY_COLUMNS, *SEGMENT_INPUTS),
     "monetary_rarity_rental": (*KEY_COLUMNS, "renta_filled", *PRODUCT_COLUMNS),
     "customer_profile_preprocessing": (*KEY_COLUMNS, "age", "antiguedad", "renta"),
     "renta_monetary_preprocessing": (*KEY_COLUMNS, "renta", "cod_prov", "pais_residencia"),
+})
+PIPELINE_FUNCTION_INPUTS.update({
+    name: (*KEY_COLUMNS, "R_score", "F_score", solve_monetary_proxy(proxy).column)
+    for name, proxy in MONETARY_TIER_FUNCTIONS.items()
 })
 
 
@@ -101,6 +127,7 @@ def run_data_pipeline(
     renta_clip_upper_quantile: float = 0.99,
     monetary_proxy: str = "porfolio_deep",
     monetary_boundaries: Sequence[float] | None = None,
+    include_all_monetary_tiers: bool = False,
 ) -> dict[str, Any]:
     """Resolve a retained snapshot or compute and optionally publish a candidate.
 
@@ -113,16 +140,14 @@ def run_data_pipeline(
     infrastructure operation; this entrypoint never deletes retained versions.
     """
     proxy = solve_monetary_proxy(monetary_proxy)
+    if include_all_monetary_tiers and proxy.name == "rental" and monetary_boundaries is None:
+        monetary_boundaries = MONETARY_PROXY_TIER_SPECS["rental"]["boundaries"]
     if proxy.name == "rental" and monetary_boundaries is None:
         raise ValueError("rental tiering requires frozen monetary_boundaries on the log1p scale")
     if monetary_boundaries is not None:
         proxy.tier_sql("value", monetary_boundaries)
-    if proxy.name == "rarity_rental" and (
-        set(required_features).intersection(CANONICAL_RFM_TIER_FEATURE_NAMES)
-        or set(force_features).intersection(CANONICAL_RFM_TIER_FEATURE_NAMES)
-        or "rfm_tiering" in force_functions
-    ):
-        proxy.tier_sql(proxy.column, ())
+    if proxy.name == "rarity_rental" and monetary_boundaries is None:
+        monetary_boundaries = RARITY_TIER_BOUNDARIES
     forced_steps = resolve_forced_steps(
         PIPELINE_FUNCTION_OUTPUTS, force_features=force_features, force_functions=force_functions,
     )
@@ -133,7 +158,11 @@ def run_data_pipeline(
     if temp_directory is not None and not dry_run:
         runtime["temp_directory"] = str(temp_directory)
     store = CheckpointStore(checkpoint_root or root / "processed/canonical_customer_month", runtime=runtime)
-    required = tuple(dict.fromkeys((*required_features, *((proxy.column,) if proxy.name != "porfolio_deep" else ()))))
+    required = tuple(dict.fromkeys((
+        *required_features, *((proxy.column,) if proxy.name != "porfolio_deep" else ()),
+        *(CANONICAL_RFM_TIER_FEATURE_NAMES if proxy.name == "rarity_rental" else ()),
+        *(ALL_MONETARY_TIER_FEATURE_NAMES if include_all_monetary_tiers else ()),
+    )))
     monetary_contract = {"monetary_proxy": proxy.name,
                          "monetary_boundaries": list(monetary_boundaries) if monetary_boundaries is not None else None}
     resolved = store.resolve(required, required_artifacts=("train",), required_configuration=monetary_contract,
@@ -141,9 +170,11 @@ def run_data_pipeline(
     if resolved is not None and not force_process and not forced_steps and not dry_run:
         path = store.root / resolved["artifacts"]["train"]["path"]
         print(f"[checkpoint] REUSE version={resolved['version']} | final validation=PASS")
+        if SEGMENT_FEATURE in resolved.get("features", ()):
+            segment_distribution(path, memory_limit=memory_limit, threads=threads)
         return {"status": "reused", "customer_month": path, "version": resolved,
                 "processing": [], "published": False, "monetary_proxy": proxy.name,
-                "monetary_tiering_available": proxy.name != "rarity_rental"}
+                "monetary_tiering_available": True}
 
     parent = resolved or store.resolve([], required_artifacts=("train",))
     parent_config = (parent or {}).get("configuration", {})
@@ -151,14 +182,20 @@ def run_data_pipeline(
         parent_config.get("monetary_proxy", "porfolio_deep") != proxy.name
         or parent_config.get("monetary_boundaries") != monetary_contract["monetary_boundaries"])
     effective_force_functions = tuple(dict.fromkeys((*force_functions,
-        *(("rfm_tiering",) if selector_changed and proxy.name != "rarity_rental" else ()))))
+        *(("rfm_tiering",) if selector_changed else ()))))
     parent_features = set((parent or {}).get("features", ()))
+    active_monetary_tier_functions = {
+        name: selected_proxy for name, selected_proxy in MONETARY_TIER_FUNCTIONS.items()
+        if include_all_monetary_tiers or name in force_functions
+        or set(PIPELINE_FUNCTION_OUTPUTS[name]).intersection((*required, *force_features, *parent_features))
+    }
     include_rarity = (proxy.name == "rarity_rental" or RARITY_FEATURE in required
                       or RARITY_FEATURE in force_features or RARITY_FEATURE in parent_features
-                      or "monetary_rarity_rental" in force_functions)
+                      or "monetary_rarity_rental" in force_functions
+                      or "rarity_rental" in active_monetary_tier_functions.values())
     active_outputs = {name: outputs for name, outputs in PIPELINE_FUNCTION_OUTPUTS.items()
                       if (name != "monetary_rarity_rental" or include_rarity)
-                      and (name != "rfm_tiering" or proxy.name != "rarity_rental")}
+                      and (name not in MONETARY_TIER_FUNCTIONS or name in active_monetary_tier_functions)}
     active_inputs = dict(PIPELINE_FUNCTION_INPUTS)
     active_inputs["rfm_tiering"] = (*CANONICAL_RFM_TIER_INPUTS[:-1], proxy.column)
     if dry_run:
@@ -189,7 +226,7 @@ def run_data_pipeline(
                 "version": parent, "processing": processing, "published": False,
                 "will_reuse": will_reuse,
                 "needs_ingestion": parent is None, "monetary_proxy": proxy.name,
-                "monetary_tiering_available": proxy.name != "rarity_rental",
+                "monetary_tiering_available": True,
                 "unsatisfied_required_features": sorted(set(required) - predicted)}
     work = Path(work_root or root / ".pipeline_work")
     work.mkdir(parents=True, exist_ok=True)
@@ -366,17 +403,39 @@ def run_data_pipeline(
         )
         return {"train": result}
 
+    def fixed_segments(current: dict[str, Path]) -> dict[str, Path]:
+        result = materialize_fixed_rfm_segments(
+            current["train"], run_dir / "rfm_segment_fixed_candidate.parquet",
+            force_process=True, memory_limit=memory_limit, threads=threads,
+        )
+        return {"train": result}
+
+    def monetary_tier_step(name, selected_proxy):
+        def materialize(current):
+            result = materialize_monetary_proxy_tiers(
+                current["train"], run_dir / f"{name}_candidate.parquet",
+                monetary_proxy=selected_proxy, force_process=True,
+                memory_limit=memory_limit, threads=threads, temp_directory=spill,
+            )
+            return {"train": result}
+        return ProcessingStep(name, PIPELINE_FUNCTION_OUTPUTS[name], active_inputs[name], materialize, validate)
+
     steps = [
         ProcessingStep("customer_profile_preprocessing", (*profile_outputs, PREPROCESSING_MARKER),
                        (*KEY_COLUMNS, "age", "antiguedad", "renta"), preprocess, validate),
         ProcessingStep("renta_monetary_preprocessing", (*RENTA_OUTPUTS, "renta"),
                        (*KEY_COLUMNS, "renta", "cod_prov", "pais_residencia"), preprocess_income, validate),
         *(feature_step(name, outputs) for name, outputs in active_outputs.items()
-          if name not in {"customer_profile_preprocessing", "renta_monetary_preprocessing", "rfm_tiering", "monetary_rarity_rental"}),
+          if name not in {"customer_profile_preprocessing", "renta_monetary_preprocessing", "rfm_tiering", "monetary_rarity_rental", "rfm_segment_fixed"}
+          and name not in MONETARY_TIER_FUNCTIONS),
         *([ProcessingStep("monetary_rarity_rental", (RARITY_FEATURE,),
                           active_inputs["monetary_rarity_rental"], rarity_monetary, validate)] if include_rarity else []),
-        *([ProcessingStep("rfm_tiering", CANONICAL_RFM_TIER_FEATURE_NAMES,
-                          active_inputs["rfm_tiering"], tier_rfm, validate)] if proxy.name != "rarity_rental" else []),
+        ProcessingStep("rfm_tiering", CANONICAL_RFM_TIER_FEATURE_NAMES,
+                       active_inputs["rfm_tiering"], tier_rfm, validate),
+        ProcessingStep("rfm_segment_fixed", (SEGMENT_FEATURE,),
+                       active_inputs["rfm_segment_fixed"], fixed_segments, validate),
+        *(monetary_tier_step(name, selected_proxy)
+          for name, selected_proxy in active_monetary_tier_functions.items()),
     ]
     candidates, processing = run_processing_pipeline(
         working, steps, force_process=force_process, required_features=required,
@@ -406,7 +465,15 @@ def run_data_pipeline(
                      for step in processing)
     configuration = {
         **monetary_contract,
-        "monetary_tiering_available": proxy.name != "rarity_rental",
+        "include_all_monetary_tiers": include_all_monetary_tiers,
+        "monetary_proxy_tiering": {
+            selected_proxy: {**MONETARY_PROXY_TIER_SPECS[selected_proxy],
+                             "outputs": list(MONETARY_PROXY_TIER_OUTPUTS[selected_proxy]),
+                             "column": solve_monetary_proxy(selected_proxy).column,
+                             "transform": solve_monetary_proxy(selected_proxy).transform}
+            for selected_proxy in active_monetary_tier_functions.values()
+        },
+        "monetary_tiering_available": True,
         "rarity_income_column": "renta_filled" if include_rarity else None,
         "rarity_definition_version": (FORMULA_VERSION if rarity_ran else parent_config.get("rarity_definition_version")) if include_rarity else None,
         "required_features": list(required), "force_process": force_process,
@@ -418,15 +485,15 @@ def run_data_pipeline(
         "threads": threads, "validation_column_batch_size": validation_column_batch_size,
         "renta_clip_upper_quantile": renta_clip_upper_quantile,
         "rfm_tiering": {
-            "boundaries": ({**CANONICAL_RFM_BOUNDARIES,
-                            "monetary": list(monetary_boundaries) if monetary_boundaries is not None
-                            else CANONICAL_RFM_BOUNDARIES["monetary"]}
-                           if proxy.name != "rarity_rental" else None),
-            "methods": ({**CANONICAL_RFM_METHODS,
-                         "monetary": "frozen_explicit" if monetary_boundaries is not None
-                         else CANONICAL_RFM_METHODS["monetary"]}
-                        if proxy.name != "rarity_rental" else None),
-            "monetary_proxy": proxy.name, "available": proxy.name != "rarity_rental",
+            "boundaries": {**CANONICAL_RFM_BOUNDARIES,
+                           "monetary": list(monetary_boundaries) if monetary_boundaries is not None
+                           else CANONICAL_RFM_BOUNDARIES["monetary"]},
+            "methods": {**CANONICAL_RFM_METHODS,
+                        "monetary": (RARITY_TIER_METHOD if proxy.name == "rarity_rental"
+                                     and tuple(monetary_boundaries) == RARITY_TIER_BOUNDARIES
+                                     else "frozen_explicit" if monetary_boundaries is not None
+                                     else CANONICAL_RFM_METHODS["monetary"])},
+            "monetary_proxy": proxy.name, "available": True,
         },
         "preprocessing_stats": (
             json.loads((run_dir / "profile/preprocessing_stats.json").read_text(encoding="utf-8"))
@@ -443,6 +510,13 @@ def run_data_pipeline(
         if prior and (store.root / prior).is_file():
             sidecars["rarity_product_weights"] = store.root / prior
     definitions = {step.name: {"outputs": list(step.outputs), "inputs": list(step.required_inputs)} for step in steps}
+    for name, selected_proxy in active_monetary_tier_functions.items():
+        definitions[name].update(configuration["monetary_proxy_tiering"][selected_proxy])
+    definitions["rfm_segment_fixed"].update(SEGMENT_PROVENANCE)
+    if parent and not any(s["step"] == "rfm_segment_fixed" and s["decision"] == "RUN" for s in processing):
+        previous = parent.get("feature_definition_metadata", {}).get("rfm_segment_fixed")
+        if previous is not None:
+            definitions["rfm_segment_fixed"] = previous
     if include_rarity:
         definitions["monetary_rarity_rental"].update(
             income_column="renta_filled", ownership="nullable lag of original product states",
@@ -464,7 +538,7 @@ def run_data_pipeline(
     path = store.root / version["artifacts"]["train"]["path"] if version else candidates["train"]
     return {"status": "published" if version else "candidate", "customer_month": path,
             "version": version, "processing": processing, "published": version is not None,
-            "monetary_proxy": proxy.name, "monetary_tiering_available": proxy.name != "rarity_rental"}
+            "monetary_proxy": proxy.name, "monetary_tiering_available": True}
 
 
 def json_summary(summary: dict[str, Any]) -> str:

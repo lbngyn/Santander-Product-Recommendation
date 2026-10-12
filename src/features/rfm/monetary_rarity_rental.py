@@ -297,9 +297,26 @@ def materialize_monetary(con: duckdb.DuckDBPyConnection, source: Path,
     return output
 
 
-def monetary_tier_sql(column, boundaries):
-    """Reserved until rarity tier boundaries and a method are approved by EDA."""
-    raise NotImplementedError("rarity_rental tiering is a placeholder; run EDA to select a tiering method first")
+# Frozen from RFM_Tiering_EDA_Rarity_Income.ipynb / quantile_k3.
+# Reference through 2015-12-28; evaluation Jan-Apr 2016; May holdout untouched.
+# Keep full precision and never refit these boundaries during materialization.
+MONETARY_TIER_METHOD = "quantile_k3"
+MONETARY_TIER_BOUNDARIES = (1.0, 1.0053147021432889)
+
+
+def monetary_tier_sql(column, boundaries=None):
+    """Score raw rarity income using frozen, inclusive upper cutoffs.
+
+    Missing, negative and nonfinite values remain NULL; valid zero is M1.
+    """
+    from .tiering_utils import tier_case_sql
+    selected = MONETARY_TIER_BOUNDARIES if boundaries is None else boundaries
+    if not len(selected):
+        raise ValueError("Rarity monetary tier boundaries must not be empty")
+    expr = tier_case_sql(column, selected, lower_is_better=False)
+    value = quote(column)
+    return (f"CASE WHEN {value} IS NULL OR NOT isfinite({value}) OR {value} < 0 "
+            f"THEN NULL ELSE ({expr}) END")
 
 
 def build_rarity_monetary_proxy(
