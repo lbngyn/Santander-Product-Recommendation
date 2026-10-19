@@ -17,8 +17,18 @@ from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score, adjusted_rand_score, f1_score, confusion_matrix
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.model_selection import train_test_split
-from scipy.cluster.hierarchy import cut_tree
-from scipy.spatial.distance import cdist
+try:
+ from scipy.cluster.hierarchy import cut_tree
+ from scipy.spatial.distance import cdist
+except ImportError as exc:
+ if 'scipy._cyutility' not in str(exc):
+  raise
+ raise ImportError(
+  'SciPy compiled extensions are inconsistent in this runtime. Restart the Colab '
+  'runtime/kernel after bootstrap, then run from the top. Do not reload or delete '
+  'SciPy modules in the current process. If this persists in a fresh runtime, '
+  'repair the SciPy installation there before running the benchmark.'
+ ) from exc
 
 SEED=42
 SNAPSHOT='2016-05-28'
@@ -402,7 +412,9 @@ class FactorModel:
    self.mfa_cols=ordered
    mf=frame[ordered].copy();mf.columns=pd.MultiIndex.from_tuples([(g,c) for g,cs in grp.items() for c in cs],names=['group','feature'])
    d=min(self.max_components,len(mf)-1,len(ordered)+sum(frame[c].nunique() for c in self.pre.cats))
-   self.proj=prince.MFA(n_components=d,n_iter=3,rescale_with_mean=True,rescale_with_std=True,copy=False,check_input=False,engine='sklearn',random_state=self.seed)
+   # Prince 0.14--0.16 does not expose PCA's rescale_* constructor options.
+   # Let MFA apply its own group normalization instead of forwarding PCA kwargs.
+   self.proj=prince.MFA(n_components=d,n_iter=3,copy=False,check_input=False,engine='sklearn',random_state=self.seed)
    self.proj.fit(mf,groups=list(grp));self.fit_z=self.proj.row_coordinates(mf).to_numpy(dtype=np.float32)
    try:self.ratio=np.asarray(self.proj.percentage_of_variance_,dtype=float)/100
    except Exception:self.ratio=np.full(self.fit_z.shape[1],np.nan)
@@ -470,6 +482,8 @@ class PersonaModel:
  def metadata(self):return dict(feature_set=self.feature_set,method=self.method,d_label=self.d_label,d=self.d,k=self.k)
 
 def fit_model(data,registry,features,method,d_label,k,seed=SEED,max_components=128,micro=128,group_balance=True):
+ # CSV readers infer integer labels when a grid has no available "95%" row.
+ d_label=str(d_label)
  pre=FrozenPrep(features,registry,group_balance=group_balance).fit(data)
  factor=FactorModel(method,pre,max_components,seed).fit(data)
  dims=factor.dims();d=dims.get(d_label)
@@ -495,4 +509,4 @@ def safe_cat_vs_cluster(frame,columns,y):
   if col in frame:
    x=frame[col].astype('string').fillna('UNKNOWN').astype(str)
    output.append(dict(feature=col,nmi=float(normalized_mutual_info_score(x,y))))
- return pd.DataFrame(output).sort_values('nmi',ascending=False)
+ return pd.DataFrame(output,columns=['feature','nmi']).sort_values('nmi',ascending=False)
