@@ -14,7 +14,8 @@ scikit-learn
 pymc-marketing
 gensim
 scipy>=1.11
-prince>=0.14,<0.17
+# Mixed numerical/categorical MFA groups require the implementation in 0.21.
+prince==0.21.0
 joblib>=1.3
 nbformat>=5.9
 ipython>=8
